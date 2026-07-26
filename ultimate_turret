@@ -1,0 +1,616 @@
+import cv2
+import time
+import threading
+import platform
+import random
+import numpy as np
+import serial
+from flask import Flask, render_template_string, Response, jsonify, request
+
+# ==========================================
+# 1. FLASK APP & THREAD-SAFE STATE
+# ==========================================
+app = Flask(__name__)
+
+# Locks prevent Flask web workers from colliding with the OpenCV background thread
+state_lock = threading.Lock()
+frame_lock = threading.Lock()
+
+MAX_TREAT_CAPACITY = 25
+
+telemetry_state = {
+    "gait_asymmetry": 8.2,
+    "prev_day_asymmetry": 18.5,
+    "limp_delta": -10.3,
+    "current_velocity_mps": 0.0,
+    "top_sprint_mps": 0.0,
+    "turret_angle_deg": 90,
+    "launch_distance_ft": 6,
+    "treats_remaining": 20,
+    "treat_level_pct": 80,
+    "fall_count": 0,
+    "sleep_duration_sec": 0.0,
+    "is_sleeping": False,
+    "turret_mode": "MANUAL",  # MANUAL or AUTO_LURE
+    "station_status": "READY: Monitoring Room Zone"
+}
+
+output_frame = None
+
+# ==========================================
+# 2. ARDUINO HARDWARE BRIDGE (NON-BLOCKING)
+# ==========================================
+try:
+    # write_timeout=0 ensures a bad USB connection never freezes the live camera feed
+    arduino = serial.Serial('/dev/cu.usbmodem14101', 9600, timeout=1, write_timeout=0)
+    print("[+] Arduino Hardware Bridge Connected.")
+except Exception as e:
+    arduino = None
+    print("[-] Arduino not detected. Running safely in Software Simulation Mode.")
+
+# ==========================================
+# 3. CROSS-PLATFORM CAMERA SETUP
+# ==========================================
+def get_universal_camera():
+    os_name = platform.system()
+    if os_name == "Darwin":
+        cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+    elif os_name == "Windows":
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    else:
+        cap = cv2.VideoCapture(0)
+
+    # Fallback if primary is occupied
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(1)
+
+    # Enforce strict resolution on ANY camera to protect the UI layout
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        time.sleep(0.3)
+        
+    return cap
+
+# ==========================================
+# 4. STATIONARY VISION ENGINE & AUTO-LURE
+# ==========================================
+def vision_thread_loop():
+    global output_frame, telemetry_state, arduino
+    
+    cap = get_universal_camera()
+    prev_gray = None
+    prev_center_x = None
+    inactivity_start_time = None
+    last_tick_time = time.time()
+    last_fall_time = time.time()
+    auto_fire_timer = time.time()
+    
+    # Scale factor mapping pixels to meters for indoor living room tracking
+    PIXEL_TO_METER_SCALE = 0.005
+
+    while True:
+        if not cap.isOpened():
+            time.sleep(1.0)
+            cap = get_universal_camera()
+            continue
+
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            time.sleep(0.05)
+            continue
+
+        now = time.time()
+        dt = now - last_tick_time
+        # Prevent division-by-zero errors in extremely fast thread loops
+        last_tick_time = now if dt > 0.001 else last_tick_time + 0.001
+
+        # Process frame
+        frame = cv2.flip(frame, 1)
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        curr_gray = cv2.GaussianBlur(curr_gray, (21, 21), 0)
+
+        if prev_gray is not None:
+            frame_diff = cv2.absdiff(prev_gray, curr_gray)
+            thresh = cv2.threshold(frame_diff, 25, 255, cv2.THRESH_BINARY)[1]
+            
+            motion_pixels = float(np.sum(thresh > 0))
+            total_pixels = frame.shape[0] * frame.shape[1]
+            motion_ratio = (motion_pixels / total_pixels) * 100.0
+
+            with state_lock:
+                # 1. SLEEP & INACTIVITY DETECTOR
+                if motion_ratio < 0.8:
+                    if inactivity_start_time is None:
+                        inactivity_start_time = now
+                    elif (now - inactivity_start_time) > 3.0:
+                        telemetry_state["is_sleeping"] = True
+                        telemetry_state["sleep_duration_sec"] += dt
+                else:
+                    inactivity_start_time = None
+                    telemetry_state["is_sleeping"] = False
+
+                # 2. FALL DETECTOR
+                if motion_ratio > 35.0 and (now - last_fall_time > 4.0):
+                    telemetry_state["fall_count"] += 1
+                    last_fall_time = now
+
+                # 3. LIMP DELTA CALCULATION
+                current_limp = telemetry_state["gait_asymmetry"]
+                telemetry_state["limp_delta"] = round(current_limp - telemetry_state["prev_day_asymmetry"], 1)
+
+                # 4. AUTONOMOUS AUTO-LURE PATROL
+                if telemetry_state["turret_mode"] == "AUTO_LURE":
+                    if not telemetry_state["is_sleeping"] and telemetry_state["treats_remaining"] > 0:
+                        # Fire a treat every 8 seconds dynamically across the room
+                        if now - auto_fire_timer > 8.0:
+                            telemetry_state["turret_angle_deg"] = random.randint(30, 150)
+                            telemetry_state["launch_distance_ft"] = random.randint(4, 9)
+                            telemetry_state["treats_remaining"] -= 1
+                            telemetry_state["treat_level_pct"] = int((telemetry_state["treats_remaining"] / MAX_TREAT_CAPACITY) * 100)
+                            
+                            # Fire Physical Hardware if connected
+                            if arduino:
+                                cmd = f"FIRE:{telemetry_state['turret_angle_deg']}:{telemetry_state['launch_distance_ft']}\n"
+                                try:
+                                    arduino.write(cmd.encode())
+                                except Exception:
+                                    pass
+                                    
+                            auto_fire_timer = now
+                    else:
+                        auto_fire_timer = now # Pause auto-timer if pet is sleeping or treats are empty
+
+            # 5. SPRINT VELOCITY CENTROID TRACKER
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                largest_cnt = max(contours, key=cv2.contourArea)
+                if cv2.contourArea(largest_cnt) > 800:
+                    M = cv2.moments(largest_cnt)
+                    if M["m00"] != 0:
+                        curr_center_x = int(M["m10"] / M["m00"])
+                        
+                        if prev_center_x is not None and dt > 0:
+                            dx_pixels = abs(curr_center_x - prev_center_x)
+                            distance_m = dx_pixels * PIXEL_TO_METER_SCALE
+                            velocity_mps = round(distance_m / dt, 2)
+                            
+                            # Sanity check to prevent glitchy OpenCV light noise from recording 100 m/s
+                            if velocity_mps < 15.0:
+                                with state_lock:
+                                    telemetry_state["current_velocity_mps"] = velocity_mps
+                                    if velocity_mps > telemetry_state["top_sprint_mps"]:
+                                        telemetry_state["top_sprint_mps"] = velocity_mps
+                                    
+                        prev_center_x = curr_center_x
+            else:
+                with state_lock:
+                    telemetry_state["current_velocity_mps"] = 0.0
+
+        prev_gray = curr_gray
+
+        # HUD Overlay Rendering
+        with state_lock:
+            velocity_val = telemetry_state['current_velocity_mps']
+            angle_val = telemetry_state['turret_angle_deg']
+            dist_val = telemetry_state['launch_distance_ft']
+            delta_val = telemetry_state['limp_delta']
+            mode_val = telemetry_state['turret_mode']
+            fall_val = telemetry_state['fall_count']
+
+        cv2.rectangle(frame, (10, 10), (410, 150), (0, 0, 0), -1)
+        cv2.putText(frame, f"MODE: {mode_val}", (20, 35), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 136) if mode_val == 'AUTO_LURE' else (255, 200, 0), 2)
+        cv2.putText(frame, f"FETCH VELOCITY: {velocity_val} m/s", (20, 65), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 242, 254), 2)
+        cv2.putText(frame, f"TURRET PAN/DIST: {angle_val} deg / {dist_val} ft", (20, 95), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
+        
+        delta_color = (0, 255, 0) if delta_val <= 0 else (0, 0, 255)
+        cv2.putText(frame, f"LIMP DELTA: {delta_val}% | FALLS: {fall_val}", (20, 125), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, delta_color, 2)
+
+        with frame_lock:
+            output_frame = frame.copy()
+
+        time.sleep(0.01) # CPU saver
+
+# ==========================================
+# 5. FLASK API ENDPOINTS
+# ==========================================
+def generate_mjpeg_stream():
+    global output_frame
+    while True:
+        with frame_lock:
+            if output_frame is None:
+                time.sleep(0.02)
+                continue
+            ret, encoded_image = cv2.imencode(".jpg", output_frame)
+            if not ret:
+                continue
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encoded_image) + b'\r\n')
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/telemetry')
+def get_telemetry():
+    with state_lock:
+        return jsonify(telemetry_state)
+
+@app.route('/api/turret/mode', methods=['POST'])
+def toggle_mode():
+    global telemetry_state
+    data = request.get_json() or {}
+    mode = data.get("mode", "MANUAL")
+    with state_lock:
+        telemetry_state["turret_mode"] = mode
+    return jsonify({"mode": mode})
+
+@app.route('/api/turret/aim', methods=['POST'])
+def aim_turret():
+    global telemetry_state
+    data = request.get_json() or {}
+    angle = data.get("angle", 90)
+    distance = data.get("distance", 6)
+    
+    with state_lock:
+        telemetry_state["turret_mode"] = "MANUAL" # Manual aim always overrides auto
+        telemetry_state["turret_angle_deg"] = int(angle)
+        telemetry_state["launch_distance_ft"] = int(distance)
+        
+    return jsonify({"status": "AIMED"})
+
+@app.route('/api/turret/fire', methods=['POST'])
+def fire_turret():
+    global telemetry_state, arduino
+    with state_lock:
+        telemetry_state["turret_mode"] = "MANUAL" # Manual fire overrides auto
+        if telemetry_state["treats_remaining"] > 0:
+            telemetry_state["treats_remaining"] -= 1
+            telemetry_state["treat_level_pct"] = int((telemetry_state["treats_remaining"] / MAX_TREAT_CAPACITY) * 100)
+            status = "FIRED"
+            
+            # FIRE PHYSICAL HARDWARE
+            if arduino:
+                cmd = f"FIRE:{telemetry_state['turret_angle_deg']}:{telemetry_state['launch_distance_ft']}\n"
+                try:
+                    arduino.write(cmd.encode())
+                except Exception:
+                    pass
+        else:
+            status = "EMPTY"
+    return jsonify({"status": status})
+
+@app.route('/api/turret/refill', methods=['POST'])
+def refill_turret():
+    global telemetry_state
+    with state_lock:
+        telemetry_state["treats_remaining"] = MAX_TREAT_CAPACITY
+        telemetry_state["treat_level_pct"] = 100
+    return jsonify({"status": "REFILLED"})
+
+# ==========================================
+# 6. TAILWIND ULTIMATE UI DASHBOARD
+# ==========================================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PitPaws // Ultimate Turret Command</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .glass { background: rgba(18, 24, 38, 0.75); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); }
+        .glow-cyan { box-shadow: 0 0 20px rgba(6, 182, 212, 0.15); }
+    </style>
+</head>
+<body class="bg-[#080b11] text-slate-200 min-h-screen p-6">
+
+    <header class="flex justify-between items-center pb-6 mb-6 border-b border-slate-800/80">
+        <div class="flex items-center gap-3">
+            <div class="p-2.5 bg-cyan-500/10 border border-cyan-500/30 rounded-xl text-cyan-400">
+                <i data-lucide="crosshair" class="w-6 h-6"></i>
+            </div>
+            <div>
+                <h1 class="font-extrabold text-xl tracking-wider text-white">PITPAWS <span class="text-cyan-400 text-xs px-2 py-0.5 rounded bg-cyan-950 border border-cyan-800 mono">ULTIMATE STATION</span></h1>
+                <p class="text-xs text-slate-400">Fixed-Zone Biomechanics & Autonomous Lure System</p>
+            </div>
+        </div>
+
+        <div class="flex items-center gap-4">
+            <div id="mode-badge" class="flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 text-xs font-semibold">
+                <span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>
+                MANUAL MODE ACTIVE
+            </div>
+        </div>
+    </header>
+
+    <main class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+        <div class="lg:col-span-2 space-y-6">
+            <div class="glass rounded-2xl overflow-hidden relative border border-slate-800 glow-cyan">
+                <div class="absolute top-4 left-4 z-10 flex items-center gap-2 px-3 py-1 bg-black/70 backdrop-blur rounded-md text-xs mono text-cyan-400 border border-cyan-500/30">
+                    <i data-lucide="camera" class="w-3.5 h-3.5"></i> FIXED ROOM KINEMATICS FEED
+                </div>
+                <div class="aspect-video bg-black flex items-center justify-center relative">
+                    <img src="/video_feed" class="w-full h-full object-cover" alt="Kinematic Vision Feed">
+                </div>
+            </div>
+
+            <div class="glass rounded-2xl p-5 border border-slate-800">
+                <div class="flex justify-between items-center mb-4">
+                    <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mono flex items-center gap-2">
+                        <i data-lucide="gauge" class="w-4 h-4 text-emerald-400"></i> Fetch & Sprint Velocity (m/s)
+                    </h3>
+                </div>
+                <div class="h-40">
+                    <canvas id="velocityChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <div class="space-y-4">
+
+            <!-- Drive Mode Selection -->
+            <div class="glass rounded-2xl p-5 border border-slate-800 text-center">
+                <span class="text-xs text-slate-400 uppercase tracking-wider mono flex items-center justify-center gap-1.5 mb-3">
+                    <i data-lucide="bot" class="w-4 h-4 text-cyan-400"></i> Turret Mode Selector
+                </span>
+                <div class="grid grid-cols-2 gap-3">
+                    <button id="btn-manual" onclick="setTurretMode('MANUAL')" class="py-2.5 px-3 rounded-xl border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 font-semibold text-xs transition">
+                        MANUAL AIM
+                    </button>
+                    <button id="btn-auto" onclick="setTurretMode('AUTO_LURE')" class="py-2.5 px-3 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-xs hover:border-slate-600 transition">
+                        AUTO LURE PATROL
+                    </button>
+                </div>
+            </div>
+
+            <!-- Turret Aim & Launch Controls -->
+            <div class="glass rounded-2xl p-5 border border-amber-500/30 bg-amber-500/5">
+                <span class="text-xs text-amber-400 uppercase tracking-wider mono flex items-center justify-center gap-1.5 mb-3">
+                    <i data-lucide="crosshair" class="w-4 h-4 text-amber-400"></i> Manual Override Aiming
+                </span>
+
+                <div class="space-y-3 my-2 text-left">
+                    <div>
+                        <div class="flex justify-between text-xs mono text-slate-400 mb-1">
+                            <span>PAN ANGLE:</span>
+                            <span id="angle-val" class="text-cyan-400 font-bold">90° (CENTER)</span>
+                        </div>
+                        <!-- CHANGED oninput TO onchange TO PREVENT NETWORK SPAMMING -->
+                        <input type="range" id="angle-slider" min="0" max="180" value="90" onchange="updateAim()" oninput="updateAimText()" class="w-full accent-cyan-400 bg-slate-800 h-2 rounded-lg cursor-pointer">
+                    </div>
+
+                    <div>
+                        <div class="flex justify-between text-xs mono text-slate-400 mb-1">
+                            <span>LAUNCH DISTANCE:</span>
+                            <span id="dist-val" class="text-amber-400 font-bold">6 FT</span>
+                        </div>
+                        <!-- CHANGED oninput TO onchange TO PREVENT NETWORK SPAMMING -->
+                        <input type="range" id="dist-slider" min="3" max="10" value="6" onchange="updateAim()" oninput="updateAimText()" class="w-full accent-amber-400 bg-slate-800 h-2 rounded-lg cursor-pointer">
+                    </div>
+                </div>
+
+                <button onclick="fireTurret()" class="w-full mt-4 py-3 px-4 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-black font-extrabold rounded-xl transition shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2">
+                    <i data-lucide="zap" class="w-5 h-5 fill-black"></i> FIRE TURRET (SPACE)
+                </button>
+            </div>
+
+            <!-- Inventory Metric -->
+            <div class="glass rounded-2xl p-4 border border-slate-800 flex justify-between items-center">
+                <div>
+                    <span class="text-xs text-slate-400 uppercase tracking-wider mono">Treat Reservoir</span>
+                    <div class="text-2xl font-extrabold text-white mt-0.5 mono"><span id="treat-remaining">20</span><span class="text-slate-500 text-xs"> / 25</span></div>
+                </div>
+                <button onclick="refillTurret()" class="py-1.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-lg transition border border-slate-700">
+                    REFILL
+                </button>
+            </div>
+
+            <!-- FALLS & SLEEP METRICS -->
+            <div class="grid grid-cols-2 gap-4">
+                <div class="glass rounded-2xl p-4 border border-slate-800 flex justify-between items-center">
+                    <div>
+                        <span class="text-[10px] text-slate-400 uppercase tracking-wider mono">Falls Today</span>
+                        <div class="text-xl font-extrabold text-white mt-0.5 mono"><span id="fall-count">0</span></div>
+                    </div>
+                    <div class="p-2 bg-red-500/10 rounded-lg text-red-400 border border-red-500/20">
+                        <i data-lucide="alert-triangle" class="w-4 h-4"></i>
+                    </div>
+                </div>
+
+                <div class="glass rounded-2xl p-4 border border-slate-800 flex justify-between items-center">
+                    <div>
+                        <span class="text-[10px] text-slate-400 uppercase tracking-wider mono">Inactive Time</span>
+                        <div class="text-xl font-extrabold text-white mt-0.5 mono"><span id="sleep-time">0m 0s</span></div>
+                    </div>
+                    <div class="p-2 bg-indigo-500/10 rounded-lg text-indigo-400 border border-indigo-500/20">
+                        <i data-lucide="moon" class="w-4 h-4"></i>
+                    </div>
+                </div>
+            </div>
+
+            <!-- KINETIC METRICS -->
+            <div class="grid grid-cols-3 gap-3">
+                <div class="glass rounded-2xl p-4 border border-slate-800">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider mono">Asymmetry</span>
+                    <div class="text-xl font-extrabold text-cyan-400 mt-1 mono"><span id="asymmetry">8.2</span><span class="text-[10px] text-slate-500">%</span></div>
+                </div>
+                
+                <div class="glass rounded-2xl p-4 border border-slate-800">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider mono">Peak Sprint</span>
+                    <div class="text-xl font-extrabold text-emerald-400 mt-1 mono"><span id="top-vel">0.0</span><span class="text-[10px] text-slate-500">m/s</span></div>
+                </div>
+
+                <div class="glass rounded-2xl p-4 border border-slate-800 relative overflow-hidden">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider mono">Limp Delta</span>
+                    <div class="text-xl font-extrabold mt-1 mono"><span id="limp-delta">-10.3%</span></div>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <script>
+        lucide.createIcons();
+
+        const ctx = document.getElementById('velocityChart').getContext('2d');
+        const velocityChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: Array(25).fill(''),
+                datasets: [{
+                    label: 'Velocity m/s',
+                    data: Array(25).fill(0),
+                    borderColor: '#10b981',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    fill: true,
+                    backgroundColor: 'rgba(16, 185, 129, 0.08)',
+                    pointRadius: 0
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    x: { display: false },
+                    y: { min: 0, max: 5, grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#64748b', font: { family: 'JetBrains Mono' } } }
+                }
+            }
+        });
+
+        async function setTurretMode(mode) {
+            try {
+                await fetch('/api/turret/mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode })
+                });
+            } catch (err) {}
+        }
+
+        // Just updates the text instantly for visual feedback without hitting the server
+        function updateAimText() {
+            const angle = document.getElementById('angle-slider').value;
+            const distance = document.getElementById('dist-slider').value;
+            document.getElementById('angle-val').innerText = `${angle}° (${angle == 90 ? 'CENTER' : (angle < 90 ? 'LEFT' : 'RIGHT')})`;
+            document.getElementById('dist-val').innerText = `${distance} FT`;
+        }
+
+        // Only hits the server when the user lets go of the slider (onchange)
+        async function updateAim() {
+            const angle = document.getElementById('angle-slider').value;
+            const distance = document.getElementById('dist-slider').value;
+            try {
+                await fetch('/api/turret/aim', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ angle, distance })
+                });
+            } catch (e) {}
+        }
+
+        async function fireTurret() {
+            try {
+                await fetch('/api/turret/fire', { method: 'POST' });
+            } catch (err) {}
+        }
+
+        async function refillTurret() {
+            try {
+                await fetch('/api/turret/refill', { method: 'POST' });
+            } catch (err) {}
+        }
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                e.preventDefault();
+                fireTurret();
+            }
+        });
+
+        async function syncTelemetry() {
+            try {
+                const res = await fetch('/api/telemetry');
+                const data = await res.json();
+
+                // UI Mode Styling
+                const manualBtn = document.getElementById('btn-manual');
+                const autoBtn = document.getElementById('btn-auto');
+                const badge = document.getElementById('mode-badge');
+
+                if (data.turret_mode === 'AUTO_LURE') {
+                    autoBtn.className = 'py-2.5 px-3 rounded-xl border border-emerald-500/40 bg-emerald-500/20 text-emerald-300 font-semibold text-xs transition';
+                    manualBtn.className = 'py-2.5 px-3 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-xs hover:border-slate-600 transition';
+                    badge.className = 'flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-semibold';
+                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> AUTO LURE PATROL ACTIVE';
+                    
+                    // Sync sliders visually if in Auto Mode
+                    document.getElementById('angle-slider').value = data.turret_angle_deg;
+                    document.getElementById('dist-slider').value = data.launch_distance_ft;
+                    updateAimText();
+                } else {
+                    manualBtn.className = 'py-2.5 px-3 rounded-xl border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 font-semibold text-xs transition';
+                    autoBtn.className = 'py-2.5 px-3 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-xs hover:border-slate-600 transition';
+                    badge.className = 'flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 text-xs font-semibold';
+                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span> MANUAL AIM ACTIVE';
+                }
+
+                // Core Metrics
+                document.getElementById('asymmetry').innerText = data.gait_asymmetry;
+                document.getElementById('top-vel').innerText = data.top_sprint_mps;
+                document.getElementById('treat-remaining').innerText = data.treats_remaining;
+                document.getElementById('fall-count').innerText = data.fall_count;
+
+                // Sleep Time formatting
+                const totalSec = Math.floor(data.sleep_duration_sec);
+                const mins = Math.floor(totalSec / 60);
+                const secs = totalSec % 60;
+                document.getElementById('sleep-time').innerText = `${mins}m ${secs}s`;
+
+                // Limp Delta formatting
+                const deltaEl = document.getElementById('limp-delta');
+                if (data.limp_delta <= 0) {
+                    deltaEl.innerText = `${data.limp_delta}%`;
+                    deltaEl.className = 'text-emerald-400';
+                } else {
+                    deltaEl.innerText = `+${data.limp_delta}%`;
+                    deltaEl.className = 'text-red-400';
+                }
+
+                // Update Velocity Chart
+                velocityChart.data.datasets[0].data.push(data.current_velocity_mps);
+                velocityChart.data.datasets[0].data.shift();
+                velocityChart.update('none');
+            } catch (e) {}
+        }
+
+        setInterval(syncTelemetry, 200);
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+if __name__ == '__main__':
+    t = threading.Thread(target=vision_thread_loop)
+    t.daemon = True
+    t.start()
+
+    print("[+] PitPaws Ultimate Turret Server running at http://127.0.0.1:5001")
+    app.run(host='0.0.0.0', port=5001, debug=False)
