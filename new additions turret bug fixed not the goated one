@@ -5,6 +5,7 @@ import platform
 import random
 import numpy as np
 import serial
+import serial.tools.list_ports
 import os
 from collections import deque
 from flask import Flask, render_template_string, Response, jsonify, request
@@ -46,19 +47,21 @@ telemetry_state = {
 
 output_frame = None
 
-# DVR Highlight Buffer (150 frames = approx 5 seconds at 30fps)
+# DVR Highlight Buffer
 rolling_frame_buffer = deque(maxlen=150)
 highlight_countdown = 0
 
-if not os.path.exists("highlights"):
-    os.makedirs("highlights")
+# UNIVERSAL OS FILE PATHING
+highlight_dir = "highlights"
+if not os.path.exists(highlight_dir):
+    os.makedirs(highlight_dir)
 
 # ==========================================
 # 2. DVR EXPORT THREAD
 # ==========================================
 def export_highlight_video(frames_to_save):
-    filename = f"highlights/carbon_sprint_{int(time.time())}.mp4"
-    # Fallback codecs for cross-platform support
+    # os.path.join handles Windows (\) vs Mac/Linux (/) slash differences automatically
+    filename = os.path.join(highlight_dir, f"carbon_sprint_{int(time.time())}.mp4")
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(filename, fourcc, 30.0, (640, 480))
     for f in frames_to_save:
@@ -67,27 +70,57 @@ def export_highlight_video(frames_to_save):
     print(f"[+] Highlight Saved to disk: {filename}")
 
 # ==========================================
-# 3. ARDUINO HARDWARE BRIDGE
+# 3. UNIVERSAL ARDUINO AUTO-DISCOVERY
 # ==========================================
-try:
-    arduino = serial.Serial('/dev/cu.usbmodem14101', 9600, timeout=1, write_timeout=0)
-    print("[+] Arduino Hardware Bridge Connected.")
-except Exception as e:
+def get_universal_arduino_port():
+    ports = serial.tools.list_ports.comports()
+    for port in ports:
+        desc = port.description.lower()
+        device = port.device.lower()
+        # Scan for common Arduino/Serial chip identifiers across all operating systems
+        if "arduino" in desc or "ch340" in desc or "cp210" in desc or \
+           "usbmodem" in device or "ttyacm" in device or "ttyusb" in device:
+            return port.device
+            
+    # Blind fallback for Windows generic COM ports if names are masked
+    for port in ports:
+        if "com" in port.device.lower():
+            return port.device
+            
+    return None
+
+arduino_port = get_universal_arduino_port()
+if arduino_port:
+    try:
+        arduino = serial.Serial(arduino_port, 9600, timeout=1, write_timeout=0)
+        print(f"[+] Arduino Hardware Bridge Connected on: {arduino_port}")
+    except Exception as e:
+        arduino = None
+        print(f"[-] Found {arduino_port} but could not connect. Running Software Simulation.")
+else:
     arduino = None
-    print("[-] Arduino not detected. Running safely in Software Simulation Mode.")
+    print("[-] No Arduino detected via Auto-Scan. Running safely in Software Simulation Mode.")
 
 # ==========================================
-# 4. CROSS-PLATFORM CAMERA SETUP
+# 4. UNIVERSAL CAMERA SETUP
 # ==========================================
 def get_universal_camera():
     os_name = platform.system()
+    cap = None
+    
+    # Try OS-Specific high performance drivers first
     if os_name == "Darwin":
         cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
     elif os_name == "Windows":
         cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    else:
+    elif os_name == "Linux":
+        cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+
+    # Generic Fallback if specific drivers fail
+    if cap is None or not cap.isOpened():
         cap = cv2.VideoCapture(0)
 
+    # Secondary camera index fallback
     if not cap.isOpened():
         cap = cv2.VideoCapture(1)
 
@@ -124,6 +157,8 @@ def vision_thread_loop():
         if not ret or frame is None:
             time.sleep(0.05)
             continue
+            
+        frame = cv2.resize(frame, (640, 480))
 
         now = time.time()
         dt = now - last_tick_time
@@ -133,8 +168,8 @@ def vision_thread_loop():
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         curr_gray = cv2.GaussianBlur(curr_gray, (21, 21), 0)
 
-        # Append pure frame to DVR Buffer
-        rolling_frame_buffer.append(frame.copy())
+        with frame_lock:
+            rolling_frame_buffer.append(frame.copy())
 
         if prev_gray is not None:
             frame_diff = cv2.absdiff(prev_gray, curr_gray)
@@ -158,11 +193,9 @@ def vision_thread_loop():
                 if motion_ratio > 35.0 and (now - last_fall_time > 4.0):
                     telemetry_state["fall_count"] += 1
                     last_fall_time = now
-                    # Trigger DVR on Fall
                     if highlight_countdown == 0:
-                        highlight_countdown = 75 # Capture 2.5s post-fall
+                        highlight_countdown = 75
 
-                # Autonomous Auto-Lure
                 if telemetry_state["turret_mode"] == "AUTO_LURE":
                     if not telemetry_state["is_sleeping"] and telemetry_state["treats_remaining"] > 0:
                         if now - auto_fire_timer > 8.0:
@@ -171,7 +204,6 @@ def vision_thread_loop():
                             telemetry_state["treats_remaining"] -= 1
                             telemetry_state["treat_level_pct"] = int((telemetry_state["treats_remaining"] / MAX_TREAT_CAPACITY) * 100)
                             
-                            # Start Lap Timer
                             telemetry_state["fetch_active"] = True
                             telemetry_state["fetch_start_time"] = now
                             
@@ -186,7 +218,6 @@ def vision_thread_loop():
                     else:
                         auto_fire_timer = now 
 
-            # Contour & Sprint Tracking
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 largest_cnt = max(contours, key=cv2.contourArea)
@@ -213,7 +244,6 @@ def vision_thread_loop():
                                         if velocity_mps < telemetry_state["min_sprint_mps"]:
                                             telemetry_state["min_sprint_mps"] = velocity_mps
                                             
-                                    # Trigger DVR on High Speed Sprint (> 3.0 m/s)
                                     if velocity_mps > 3.0 and highlight_countdown == 0:
                                         highlight_countdown = 75
                                         
@@ -222,10 +252,8 @@ def vision_thread_loop():
                 with state_lock:
                     telemetry_state["current_velocity_mps"] = 0.0
 
-        # Lap Timer Logic (Sector Times)
         with state_lock:
             if telemetry_state["fetch_active"]:
-                # If dog runs out and stops to eat/return, log the lap time
                 lap_elapsed = now - telemetry_state["fetch_start_time"]
                 if lap_elapsed > 2.0 and telemetry_state["current_velocity_mps"] < 0.5:
                     telemetry_state["last_lap_sec"] = round(lap_elapsed, 1)
@@ -233,21 +261,19 @@ def vision_thread_loop():
                         telemetry_state["fastest_lap_sec"] = telemetry_state["last_lap_sec"]
                     telemetry_state["fetch_active"] = False
 
-        # DVR Highlight Countdown Handler
         with state_lock:
             if highlight_countdown > 0:
                 telemetry_state["is_recording"] = True
                 highlight_countdown -= 1
                 if highlight_countdown == 0:
-                    # Save video in background
-                    frames_to_save = list(rolling_frame_buffer)
+                    with frame_lock:
+                        frames_to_save = list(rolling_frame_buffer)
                     threading.Thread(target=export_highlight_video, args=(frames_to_save,)).start()
             else:
                 telemetry_state["is_recording"] = False
 
         prev_gray = curr_gray
 
-        # Render HUD Overlay
         with state_lock:
             velocity_val = telemetry_state['current_velocity_mps']
             mode_val = telemetry_state['turret_mode']
@@ -265,7 +291,6 @@ def vision_thread_loop():
         cv2.putText(frame, f"{lap_display} | FALLS: {fall_val}", (20, 95), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
-        # Flashing REC dot for DVR
         if recording and int(time.time() * 4) % 2 == 0:
             cv2.circle(frame, (600, 30), 8, (0, 0, 255), -1)
             cv2.putText(frame, "REC", (550, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
@@ -273,7 +298,7 @@ def vision_thread_loop():
         with frame_lock:
             output_frame = frame.copy()
 
-        time.sleep(0.01)
+        time.sleep(0.03)
 
 # ==========================================
 # 6. FLASK PWA & API ENDPOINTS
@@ -281,14 +306,24 @@ def vision_thread_loop():
 def generate_mjpeg_stream():
     global output_frame
     while True:
+        current_frame = None
+        
         with frame_lock:
-            if output_frame is None:
-                time.sleep(0.02)
-                continue
-            ret, encoded_image = cv2.imencode(".jpg", output_frame)
-            if not ret: continue
+            if output_frame is not None:
+                current_frame = output_frame.copy()
+        
+        if current_frame is None:
+            time.sleep(0.02)
+            continue
+            
+        ret, encoded_image = cv2.imencode(".jpg", current_frame)
+        if not ret: 
+            continue
+            
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encoded_image) + b'\r\n')
+               
+        time.sleep(0.03)
 
 @app.route('/video_feed')
 def video_feed():
@@ -329,7 +364,6 @@ def fire_turret():
             telemetry_state["treats_remaining"] -= 1
             telemetry_state["treat_level_pct"] = int((telemetry_state["treats_remaining"] / MAX_TREAT_CAPACITY) * 100)
             
-            # Start Lap Timer for manual shots too
             telemetry_state["fetch_active"] = True
             telemetry_state["fetch_start_time"] = time.time()
             
@@ -350,7 +384,6 @@ def refill_turret():
         telemetry_state["treat_level_pct"] = 100
     return jsonify({"status": "REFILLED"})
 
-# Embedded PWA Manifest
 @app.route('/manifest.json')
 def manifest():
     return jsonify({
@@ -366,7 +399,6 @@ def manifest():
         }]
     })
 
-# Embedded Service Worker
 @app.route('/sw.js')
 def service_worker():
     sw_code = "self.addEventListener('fetch', function(event) {});"
@@ -382,7 +414,6 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>PitPaws // Ultimate Turret Command</title>
-    <!-- PWA Install Link -->
     <link rel="manifest" href="/manifest.json">
     <meta name="theme-color" content="#080b11">
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -422,7 +453,6 @@ HTML_TEMPLATE = """
     </header>
 
     <main class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-
         <div class="lg:col-span-2 space-y-6">
             <div id="video-container" class="glass rounded-2xl overflow-hidden relative border border-slate-800 glow-cyan transition-all duration-300">
                 <div class="absolute top-4 left-4 z-10 flex items-center gap-2 px-3 py-1 bg-black/70 backdrop-blur rounded-md text-[10px] sm:text-xs mono text-cyan-400 border border-cyan-500/30">
@@ -446,8 +476,6 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="space-y-4">
-
-            <!-- Drive Mode Selection -->
             <div class="glass rounded-2xl p-5 border border-slate-800 text-center">
                 <span class="text-xs text-slate-400 uppercase tracking-wider mono flex items-center justify-center gap-1.5 mb-3">
                     <i data-lucide="bot" class="w-4 h-4 text-cyan-400"></i> Turret Mode Selector
@@ -462,7 +490,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Turret Aim & Launch Controls -->
             <div class="glass rounded-2xl p-5 border border-amber-500/30 bg-amber-500/5">
                 <span class="text-xs text-amber-400 uppercase tracking-wider mono flex items-center justify-center gap-1.5 mb-3">
                     <i data-lucide="crosshair" class="w-4 h-4 text-amber-400"></i> Manual Override Aiming
@@ -491,7 +518,6 @@ HTML_TEMPLATE = """
                 </button>
             </div>
 
-            <!-- SECTOR LAP TIMES -->
             <div class="grid grid-cols-2 gap-3 mt-1">
                 <div class="glass rounded-2xl p-4 border border-slate-800 bg-gradient-to-br from-indigo-500/5 to-transparent">
                     <span class="text-[10px] text-slate-400 uppercase tracking-wider mono flex items-center gap-1">
@@ -508,7 +534,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- SPEED METRICS -->
             <div class="grid grid-cols-3 gap-3">
                 <div class="glass rounded-2xl p-3 border border-slate-800">
                     <span class="text-[10px] text-slate-400 uppercase tracking-wider mono">Peak Spd</span>
@@ -526,7 +551,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Inventory Metric -->
             <div class="glass rounded-2xl p-4 border border-slate-800 flex justify-between items-center">
                 <div>
                     <span class="text-xs text-slate-400 uppercase tracking-wider mono">Treat Reservoir</span>
@@ -536,24 +560,16 @@ HTML_TEMPLATE = """
                     REFILL
                 </button>
             </div>
-
         </div>
     </main>
 
     <script>
         lucide.createIcons();
-        
-        // PWA Service Worker Registration
-        if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.register('/sw.js');
-        }
+        if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
 
-        // Web Audio API for Training Cues
         let audioCtx;
         function initAudio() {
-            if (!audioCtx) {
-                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            }
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         }
         function playBeep(freq, duration) {
             initAudio();
@@ -563,7 +579,7 @@ HTML_TEMPLATE = """
             oscillator.frequency.value = freq;
             oscillator.connect(gainNode);
             gainNode.connect(audioCtx.destination);
-            gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime); // Gentle volume
+            gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime); 
             oscillator.start();
             setTimeout(() => oscillator.stop(), duration);
         }
@@ -596,7 +612,7 @@ HTML_TEMPLATE = """
         });
 
         async function setTurretMode(mode) {
-            initAudio(); // Required to unlock Web Audio context on user gesture
+            initAudio(); 
             try {
                 await fetch('/api/turret/mode', {
                     method: 'POST',
@@ -626,15 +642,11 @@ HTML_TEMPLATE = """
         }
 
         async function fireTurret() {
-            try {
-                await fetch('/api/turret/fire', { method: 'POST' });
-            } catch (err) {}
+            try { await fetch('/api/turret/fire', { method: 'POST' }); } catch (err) {}
         }
 
         async function refillTurret() {
-            try {
-                await fetch('/api/turret/refill', { method: 'POST' });
-            } catch (err) {}
+            try { await fetch('/api/turret/refill', { method: 'POST' }); } catch (err) {}
         }
 
         let previousMode = 'MANUAL';
@@ -650,10 +662,9 @@ HTML_TEMPLATE = """
                 const vidContainer = document.getElementById('video-container');
                 const camLabel = document.getElementById('camera-label');
 
-                // Audio Cue Logic
                 if (data.turret_mode === 'AUTO_LURE' && previousMode === 'MANUAL') {
-                    playBeep(880, 150); // A5 note
-                    setTimeout(() => playBeep(1108, 250), 200); // C#6 note
+                    playBeep(880, 150); 
+                    setTimeout(() => playBeep(1108, 250), 200); 
                 }
                 previousMode = data.turret_mode;
 
@@ -673,7 +684,6 @@ HTML_TEMPLATE = """
                     badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span> MANUAL AIM';
                 }
                 
-                // DVR Highlight UI Flash
                 if (data.is_recording) {
                     vidContainer.className = 'glass rounded-2xl overflow-hidden relative border border-red-500 glow-red transition-all duration-300';
                     camLabel.innerHTML = '<span class="text-red-400 animate-pulse">RECORDING DVR HIGHLIGHT</span>';
@@ -687,9 +697,13 @@ HTML_TEMPLATE = """
                 document.getElementById('min-vel').innerText = (data.min_sprint_mps === 99.9) ? "0.0" : data.min_sprint_mps;
                 
                 document.getElementById('last-lap').innerText = data.last_lap_sec;
+                
                 if (data.fastest_lap_sec !== 99.9) {
                     document.getElementById('fastest-lap').innerText = data.fastest_lap_sec;
-                    document.getElementById('fastest-lap-unit').classList.remove('hidden');
+                    const unitEl = document.getElementById('fastest-lap-unit');
+                    if (unitEl.classList.contains('hidden')) {
+                        unitEl.classList.remove('hidden');
+                    }
                 }
 
                 document.getElementById('treat-remaining').innerText = data.treats_remaining;
@@ -716,4 +730,4 @@ if __name__ == '__main__':
     t.start()
 
     print("[+] PitPaws Ultimate Turret Server running at http://0.0.0.0:5001")
-    app.run(host='0.0.0.0', port=5001, debug=False)
+    app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
