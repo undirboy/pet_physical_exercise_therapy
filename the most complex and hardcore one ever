@@ -1,0 +1,712 @@
+import cv2
+import time
+import threading
+import platform
+import random
+import numpy as np
+import serial
+import os
+import sqlite3
+import math
+import psutil
+from datetime import date
+from collections import deque
+from flask import Flask, render_template_string, Response, jsonify, request
+
+try:
+    import sounddevice as sd
+    AUDIO_ENABLED = True
+except ImportError:
+    AUDIO_ENABLED = False
+    print("[-] sounddevice not installed. Audio Lure disabled.")
+
+# ==========================================
+# 1. FLASK APP & SYSTEM STATE
+# ==========================================
+app = Flask(__name__)
+
+# [BUG FIX] Upgraded to RLock to prevent Deadlock freezes when writing to DB
+state_lock = threading.RLock()
+frame_lock = threading.Lock()
+
+MAX_TREAT_CAPACITY = 25
+
+telemetry_state = {
+    "gait_asymmetry": 8.2,
+    "prev_day_asymmetry": 18.5,
+    "limp_delta": -10.3,
+    "current_velocity_mps": 0.0,
+    "top_sprint_mps": 0.0,
+    "avg_sprint_mps": 0.0,
+    "min_sprint_mps": 99.9,
+    "sprint_sum": 0.0,
+    "sprint_count": 0,
+    "turret_angle_deg": 90,
+    "launch_distance_ft": 6,
+    "treats_remaining": 20,
+    "treat_level_pct": 80,
+    "fall_count": 0,
+    "sleep_duration_sec": 0.0,
+    "is_sleeping": False,
+    "turret_mode": "MANUAL",
+    "fetch_active": False,
+    "fetch_start_time": 0.0,
+    "last_lap_sec": 0.0,
+    "fastest_lap_sec": 99.9,
+    "is_recording": False,
+    "night_mode": False,
+    "bark_detected": False,
+    "show_heatmap": False,  
+    "cpu_usage": 0.0,       
+    "ram_usage": 0.0        
+}
+
+output_frame = None
+rolling_frame_buffer = deque(maxlen=150)
+highlight_countdown = 0
+
+# Heatmap Accumulator Array (Matches exact 640x480 resolution)
+heatmap_accumulator = np.zeros((480, 640), dtype=np.float32)
+
+if not os.path.exists("highlights"):
+    os.makedirs("highlights")
+
+# ==========================================
+# 2. SQLITE LOCAL DATABASE (PERSISTENCE)
+# ==========================================
+# [BUG FIX] Added check_same_thread=False to all connections
+
+def init_db():
+    conn = sqlite3.connect('pitpaws_data.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_stats
+                 (date TEXT PRIMARY KEY, top_speed REAL, fastest_lap REAL, falls INTEGER)''')
+    conn.commit()
+    conn.close()
+
+def load_db_stats():
+    today = str(date.today())
+    conn = sqlite3.connect('pitpaws_data.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute("SELECT top_speed, fastest_lap, falls FROM daily_stats WHERE date=?", (today,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        with state_lock:
+            telemetry_state["top_sprint_mps"] = row[0]
+            telemetry_state["fastest_lap_sec"] = row[1]
+            telemetry_state["fall_count"] = row[2]
+
+def update_db_stats():
+    today = str(date.today())
+    with state_lock:
+        top = telemetry_state["top_sprint_mps"]
+        lap = telemetry_state["fastest_lap_sec"]
+        falls = telemetry_state["fall_count"]
+    
+    conn = sqlite3.connect('pitpaws_data.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO daily_stats (date, top_speed, fastest_lap, falls) VALUES (?, ?, ?, ?)", 
+              (today, top, lap, falls))
+    conn.commit()
+    conn.close()
+
+# ==========================================
+# 3. BACKGROUND THREADS (DVR, AUDIO FFT, MAC HEALTH)
+# ==========================================
+def export_highlight_video(frames_to_save):
+    filename = f"highlights/sprint_{int(time.time())}.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(filename, fourcc, 30.0, (640, 480))
+    for f in frames_to_save: out.write(f)
+    out.release()
+    print(f"[+] DVR Saved: {filename}")
+
+def audio_monitor_thread():
+    if not AUDIO_ENABLED: return
+    
+    def audio_callback(indata, frames, time_info, status):
+        audio_data = indata[:, 0]
+        fft_data = np.abs(np.fft.rfft(audio_data))
+        freqs = np.fft.rfftfreq(len(audio_data), 1.0/44100)
+        
+        volume_norm = np.linalg.norm(audio_data) * 10
+        if volume_norm > 40.0:
+            dominant_freq = freqs[np.argmax(fft_data)]
+            if 500 < dominant_freq < 3000:
+                # [BUG FIX] Atomic dict update - no lock used, prevents audio crash
+                telemetry_state["bark_detected"] = True
+
+    try:
+        with sd.InputStream(callback=audio_callback, samplerate=44100, channels=1):
+            # [BUG FIX] UI flash delay pulled outside of lock to prevent video freeze
+            while True:
+                time.sleep(0.1) 
+                if telemetry_state["bark_detected"]:
+                    time.sleep(1.0) 
+                    with state_lock:
+                        telemetry_state["bark_detected"] = False
+    except Exception:
+        print("[-] Audio monitor failed to start (Check Mac Mic Permissions).")
+
+def system_monitor_thread():
+    while True:
+        cpu = psutil.cpu_percent(interval=1)
+        ram = psutil.virtual_memory().percent
+        with state_lock:
+            telemetry_state["cpu_usage"] = cpu
+            telemetry_state["ram_usage"] = ram
+        time.sleep(2)
+
+# ==========================================
+# 4. HARDWARE BRIDGE & CAMERA
+# ==========================================
+try:
+    arduino = serial.Serial('/dev/cu.usbmodem14101', 9600, timeout=1, write_timeout=0)
+except Exception:
+    arduino = None
+
+def get_universal_camera():
+    os_name = platform.system()
+    cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION) if os_name == "Darwin" else cv2.VideoCapture(0)
+    if not cap.isOpened(): cap = cv2.VideoCapture(1)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        time.sleep(0.3)
+    return cap
+
+# ==========================================
+# 5. CORE VISION & OMNI-ENGINE
+# ==========================================
+def fire_hardware_turret():
+    global arduino, telemetry_state
+    if arduino:
+        cmd = f"FIRE:{telemetry_state['turret_angle_deg']}:{telemetry_state['launch_distance_ft']}\n"
+        try: arduino.write(cmd.encode())
+        except: pass
+
+def vision_thread_loop():
+    global output_frame, telemetry_state, highlight_countdown, heatmap_accumulator
+    
+    cap = get_universal_camera()
+    prev_gray = None
+    prev_center_x = None
+    inactivity_start_time = None
+    last_tick_time = time.time()
+    last_fall_time = time.time()
+    auto_fire_timer = time.time()
+    
+    PIXEL_TO_METER_SCALE = 0.005
+
+    while True:
+        if not cap.isOpened():
+            time.sleep(1.0)
+            cap = get_universal_camera()
+            continue
+
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            time.sleep(0.05)
+            continue
+            
+        # [BUG FIX] Force resize to 640x480 immediately to prevent Heatmap matrix crashes
+        frame = cv2.resize(frame, (640, 480))
+
+        now = time.time()
+        dt = now - last_tick_time
+        last_tick_time = now if dt > 0.001 else last_tick_time + 0.001
+
+        frame = cv2.flip(frame, 1)
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        avg_brightness = np.mean(curr_gray)
+        is_night = avg_brightness < 25.0
+        with state_lock:
+            telemetry_state["night_mode"] = is_night
+            show_heat = telemetry_state["show_heatmap"]
+
+        curr_gray = cv2.GaussianBlur(curr_gray, (21, 21), 0)
+        rolling_frame_buffer.append(frame.copy())
+
+        if prev_gray is not None and not is_night:
+            frame_diff = cv2.absdiff(prev_gray, curr_gray)
+            thresh = cv2.threshold(frame_diff, 25, 255, cv2.THRESH_BINARY)[1]
+            
+            # Accumulate motion to Heatmap
+            heatmap_accumulator += (thresh / 255.0) * 0.5 
+            heatmap_accumulator *= 0.99 
+            
+            motion_pixels = float(np.sum(thresh > 0))
+            total_pixels = frame.shape[0] * frame.shape[1]
+            motion_ratio = (motion_pixels / total_pixels) * 100.0
+
+            with state_lock:
+                if motion_ratio < 0.8:
+                    if inactivity_start_time is None: inactivity_start_time = now
+                    elif (now - inactivity_start_time) > 3.0:
+                        telemetry_state["is_sleeping"] = True
+                        telemetry_state["sleep_duration_sec"] += dt
+                else:
+                    inactivity_start_time = None
+                    telemetry_state["is_sleeping"] = False
+
+                if motion_ratio > 35.0 and (now - last_fall_time > 4.0):
+                    telemetry_state["fall_count"] += 1
+                    last_fall_time = now
+                    update_db_stats()
+                    if highlight_countdown == 0: highlight_countdown = 75 
+
+                if telemetry_state["turret_mode"] == "AUTO_LURE":
+                    should_fire = False
+                    if telemetry_state["bark_detected"] and (now - auto_fire_timer > 3.0): should_fire = True
+                    elif not telemetry_state["is_sleeping"] and (now - auto_fire_timer > 8.0): should_fire = True
+
+                    if should_fire and telemetry_state["treats_remaining"] > 0:
+                        telemetry_state["turret_angle_deg"] = random.randint(30, 150)
+                        telemetry_state["launch_distance_ft"] = random.randint(4, 9)
+                        telemetry_state["treats_remaining"] -= 1
+                        telemetry_state["treat_level_pct"] = int((telemetry_state["treats_remaining"] / MAX_TREAT_CAPACITY) * 100)
+                        telemetry_state["fetch_active"] = True
+                        telemetry_state["fetch_start_time"] = now
+                        fire_hardware_turret()
+                        auto_fire_timer = now
+
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                largest_cnt = max(contours, key=cv2.contourArea)
+                if cv2.contourArea(largest_cnt) > 800:
+                    M = cv2.moments(largest_cnt)
+                    if M["m00"] != 0:
+                        curr_center_x = int(M["m10"] / M["m00"])
+                        
+                        if prev_center_x is not None and dt > 0:
+                            dx_pixels = abs(curr_center_x - prev_center_x)
+                            velocity_mps = round((dx_pixels * PIXEL_TO_METER_SCALE) / dt, 2)
+                            
+                            if velocity_mps < 15.0:
+                                with state_lock:
+                                    telemetry_state["current_velocity_mps"] = velocity_mps
+                                    
+                                    if velocity_mps > telemetry_state["top_sprint_mps"]:
+                                        telemetry_state["top_sprint_mps"] = velocity_mps
+                                        update_db_stats()
+                                    
+                                    if velocity_mps > 0.2:
+                                        telemetry_state["sprint_sum"] += velocity_mps
+                                        telemetry_state["sprint_count"] += 1
+                                        telemetry_state["avg_sprint_mps"] = round(telemetry_state["sprint_sum"] / telemetry_state["sprint_count"], 2)
+                                        if velocity_mps < telemetry_state["min_sprint_mps"]: telemetry_state["min_sprint_mps"] = velocity_mps
+                                            
+                                    if velocity_mps > 3.0 and highlight_countdown == 0: highlight_countdown = 75
+                        prev_center_x = curr_center_x
+            else:
+                with state_lock: telemetry_state["current_velocity_mps"] = 0.0
+                    
+        elif is_night:
+            with state_lock: telemetry_state["current_velocity_mps"] = 0.0
+
+        with state_lock:
+            if telemetry_state["fetch_active"]:
+                lap_elapsed = now - telemetry_state["fetch_start_time"]
+                if lap_elapsed > 2.0 and telemetry_state["current_velocity_mps"] < 0.5:
+                    telemetry_state["last_lap_sec"] = round(lap_elapsed, 1)
+                    if telemetry_state["fastest_lap_sec"] == 99.9 or telemetry_state["last_lap_sec"] < telemetry_state["fastest_lap_sec"]:
+                        telemetry_state["fastest_lap_sec"] = telemetry_state["last_lap_sec"]
+                        update_db_stats()
+                    telemetry_state["fetch_active"] = False
+
+            if highlight_countdown > 0:
+                telemetry_state["is_recording"] = True
+                highlight_countdown -= 1
+                if highlight_countdown == 0:
+                    frames_to_save = list(rolling_frame_buffer)
+                    threading.Thread(target=export_highlight_video, args=(frames_to_save,)).start()
+            else:
+                telemetry_state["is_recording"] = False
+
+        prev_gray = curr_gray
+
+        # =====================================
+        # HUD RENDERING (Heatmap & Reticle)
+        # =====================================
+        with state_lock:
+            velocity_val = telemetry_state['current_velocity_mps']
+            mode_val = telemetry_state['turret_mode']
+            fall_val = telemetry_state['fall_count']
+            recording = telemetry_state['is_recording']
+            night = telemetry_state['night_mode']
+            angle_val = telemetry_state['turret_angle_deg']
+            dist_val = telemetry_state['launch_distance_ft']
+
+        # Apply Heatmap Overlay
+        if show_heat and not night:
+            heatmap_norm = np.clip(heatmap_accumulator, 0, 255).astype(np.uint8)
+            heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
+            frame = cv2.addWeighted(frame, 0.7, heatmap_color, 0.5, 0)
+
+        # Draw Turret Targeting Reticle
+        cam_bottom_x = int(frame.shape[1] / 2)
+        cam_bottom_y = frame.shape[0] - 10
+        math_angle = math.radians(180 - angle_val)
+        line_length = dist_val * 25
+        target_x = int(cam_bottom_x + math.cos(math_angle) * line_length)
+        target_y = int(cam_bottom_y - math.sin(math_angle) * line_length)
+        
+        cv2.line(frame, (cam_bottom_x, cam_bottom_y), (target_x, target_y), (0, 255, 255), 2)
+        cv2.circle(frame, (target_x, target_y), 15, (0, 165, 255), 2)
+        cv2.putText(frame, "TARGET", (target_x - 20, target_y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+
+        # Draw Telemetry Box
+        cv2.rectangle(frame, (10, 10), (450, 110), (0, 0, 0), -1)
+        # [BUG FIX] Changed Night Mode text to Magenta for better visibility
+        mode_color = (255, 0, 255) if night else ((0, 255, 136) if mode_val == 'AUTO_LURE' else (255, 200, 0))
+        cv2.putText(frame, f"MODE: {'NIGHT STANDBY' if night else mode_val}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, mode_color, 2)
+        cv2.putText(frame, f"FETCH VELOCITY: {velocity_val} m/s", (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 242, 254), 2)
+        cv2.putText(frame, f"DB LOGS | FALLS: {fall_val}", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+        if recording and int(time.time() * 4) % 2 == 0:
+            cv2.circle(frame, (600, 30), 8, (0, 0, 255), -1)
+            cv2.putText(frame, "REC", (550, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        with frame_lock:
+            output_frame = frame.copy()
+
+        time.sleep(0.01)
+
+# ==========================================
+# 6. FLASK PWA & API ENDPOINTS
+# ==========================================
+def generate_mjpeg_stream():
+    global output_frame
+    while True:
+        with frame_lock:
+            if output_frame is None:
+                time.sleep(0.02)
+                continue
+            ret, encoded_image = cv2.imencode(".jpg", output_frame)
+            if not ret: continue
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encoded_image) + b'\r\n')
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/telemetry')
+def get_telemetry():
+    with state_lock: return jsonify(telemetry_state)
+
+@app.route('/api/turret/mode', methods=['POST'])
+def toggle_mode():
+    data = request.get_json() or {}
+    mode = data.get("mode", "MANUAL")
+    with state_lock: telemetry_state["turret_mode"] = mode
+    return jsonify({"mode": mode})
+
+@app.route('/api/turret/heatmap', methods=['POST'])
+def toggle_heatmap():
+    with state_lock:
+        telemetry_state["show_heatmap"] = not telemetry_state["show_heatmap"]
+    return jsonify({"heatmap": telemetry_state["show_heatmap"]})
+
+@app.route('/api/turret/aim', methods=['POST'])
+def aim_turret():
+    data = request.get_json() or {}
+    with state_lock:
+        telemetry_state["turret_mode"] = "MANUAL" 
+        telemetry_state["turret_angle_deg"] = int(data.get("angle", 90))
+        telemetry_state["launch_distance_ft"] = int(data.get("distance", 6))
+    return jsonify({"status": "AIMED"})
+
+@app.route('/api/turret/fire', methods=['POST'])
+def fire_turret():
+    with state_lock:
+        telemetry_state["turret_mode"] = "MANUAL"
+        if telemetry_state["treats_remaining"] > 0:
+            telemetry_state["treats_remaining"] -= 1
+            telemetry_state["treat_level_pct"] = int((telemetry_state["treats_remaining"] / MAX_TREAT_CAPACITY) * 100)
+            telemetry_state["fetch_active"] = True
+            telemetry_state["fetch_start_time"] = time.time()
+            fire_hardware_turret()
+            status = "FIRED"
+        else:
+            status = "EMPTY"
+    return jsonify({"status": status})
+
+@app.route('/api/turret/refill', methods=['POST'])
+def refill_turret():
+    with state_lock:
+        telemetry_state["treats_remaining"] = MAX_TREAT_CAPACITY
+        telemetry_state["treat_level_pct"] = 100
+    return jsonify({"status": "REFILLED"})
+
+@app.route('/manifest.json')
+def manifest():
+    return jsonify({
+        "name": "PitPaws Titan Edition",
+        "short_name": "PitPaws",
+        "display": "standalone",
+        "background_color": "#080b11",
+        "theme_color": "#080b11",
+        "icons": [{"src": "https://cdn-icons-png.flaticon.com/512/616/616408.png", "sizes": "512x512", "type": "image/png"}]
+    })
+
+@app.route('/sw.js')
+def service_worker():
+    return Response("self.addEventListener('fetch', function(event) {});", mimetype='application/javascript')
+
+# ==========================================
+# 7. TAILWIND TITAN-DASHBOARD UI
+# ==========================================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>PitPaws // Titan Station</title>
+    <link rel="manifest" href="/manifest.json">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap');
+        body { font-family: 'Inter', sans-serif; -webkit-tap-highlight-color: transparent; }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .glass { background: rgba(18, 24, 38, 0.75); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); transition: all 0.5s ease; }
+        .glow-cyan { box-shadow: 0 0 20px rgba(6, 182, 212, 0.15); }
+        .glow-red { box-shadow: 0 0 20px rgba(239, 68, 68, 0.3); border-color: rgba(239, 68, 68, 0.5); }
+        .night-dim .glass { background: rgba(5, 5, 8, 0.95); border: 1px solid rgba(255,255,255,0.02); }
+        .night-dim text, .night-dim span, .night-dim div { color: #334155 !important; }
+        .night-dim #video-container { opacity: 0.3; filter: grayscale(100%); }
+    </style>
+</head>
+<body id="app-body" class="bg-[#080b11] text-slate-200 min-h-screen p-4 lg:p-6 pb-20 transition-all duration-700">
+
+    <header class="flex justify-between items-center pb-6 mb-6 border-b border-slate-800/80">
+        <div class="flex items-center gap-3">
+            <div id="bark-icon" class="p-2.5 bg-cyan-500/10 border border-cyan-500/30 rounded-xl text-cyan-400 transition-all duration-200">
+                <i data-lucide="crosshair" class="w-6 h-6"></i>
+            </div>
+            <div>
+                <h1 class="font-extrabold text-xl tracking-wider text-white">PITPAWS <span class="text-cyan-400 text-xs px-2 py-0.5 rounded bg-cyan-950 border border-cyan-800 mono hidden sm:inline-block">TITAN STATION</span></h1>
+            </div>
+        </div>
+
+        <div class="flex items-center gap-3">
+            <div class="hidden md:flex items-center gap-3 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-400 text-[10px] mono">
+                <span>CPU: <span id="sys-cpu" class="text-white">0%</span></span>
+                <span>RAM: <span id="sys-ram" class="text-white">0%</span></span>
+            </div>
+            <div id="mode-badge" class="flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 text-[10px] sm:text-xs font-semibold">
+                MANUAL MODE
+            </div>
+        </div>
+    </header>
+
+    <main class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+        <div class="lg:col-span-2 space-y-6">
+            <div id="video-container" class="glass rounded-2xl overflow-hidden relative border border-slate-800 glow-cyan transition-all duration-300">
+                <div class="absolute top-4 left-4 z-10 flex items-center gap-2 px-3 py-1 bg-black/70 backdrop-blur rounded-md text-[10px] sm:text-xs mono text-cyan-400 border border-cyan-500/30">
+                    <i data-lucide="camera" class="w-3.5 h-3.5"></i> <span id="camera-label">FIXED KINEMATICS + FFT</span>
+                </div>
+                <button onclick="toggleHeatmap()" class="absolute top-4 right-4 z-10 flex items-center gap-2 px-3 py-1 bg-black/70 backdrop-blur rounded-md text-[10px] sm:text-xs mono text-orange-400 border border-orange-500/30 hover:bg-orange-900/50 transition">
+                    <i data-lucide="flame" class="w-3.5 h-3.5"></i> TOGGLE HEATMAP
+                </button>
+                <div class="aspect-video bg-black flex items-center justify-center relative">
+                    <img src="/video_feed" class="w-full h-full object-contain" alt="Kinematic Vision Feed">
+                </div>
+            </div>
+
+            <div class="glass rounded-2xl p-5 border border-slate-800 hidden lg:block">
+                <div class="flex justify-between items-center mb-4">
+                    <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mono flex items-center gap-2">
+                        <i data-lucide="gauge" class="w-4 h-4 text-emerald-400"></i> Sprint Velocity (m/s)
+                    </h3>
+                </div>
+                <div class="h-40">
+                    <canvas id="velocityChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <div class="space-y-4">
+            <div class="glass rounded-2xl p-5 border border-slate-800 text-center">
+                <span class="text-xs text-slate-400 uppercase tracking-wider mono flex items-center justify-center gap-1.5 mb-3">
+                    <i data-lucide="bot" class="w-4 h-4 text-cyan-400"></i> Turret Mode Selector
+                </span>
+                <div class="grid grid-cols-2 gap-3">
+                    <button id="btn-manual" onclick="setTurretMode('MANUAL')" class="py-3 px-3 rounded-xl border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 font-semibold text-[10px] sm:text-xs transition active:scale-95">
+                        MANUAL AIM
+                    </button>
+                    <button id="btn-auto" onclick="setTurretMode('AUTO_LURE')" class="py-3 px-3 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] sm:text-xs hover:border-slate-600 transition active:scale-95">
+                        AUTO LURE PATROL
+                    </button>
+                </div>
+            </div>
+
+            <div class="glass rounded-2xl p-5 border border-amber-500/30 bg-amber-500/5">
+                <div class="space-y-3 mb-4 text-left">
+                    <div>
+                        <div class="flex justify-between text-[10px] sm:text-xs mono text-slate-400 mb-1">
+                            <span>PAN:</span> <span id="angle-val" class="text-cyan-400 font-bold">90°</span>
+                        </div>
+                        <input type="range" id="angle-slider" min="0" max="180" value="90" onchange="updateAim()" oninput="updateAimText()" class="w-full accent-cyan-400 bg-slate-800 h-2 rounded-lg cursor-pointer">
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-[10px] sm:text-xs mono text-slate-400 mb-1">
+                            <span>DISTANCE:</span> <span id="dist-val" class="text-amber-400 font-bold">6 FT</span>
+                        </div>
+                        <input type="range" id="dist-slider" min="3" max="10" value="6" onchange="updateAim()" oninput="updateAimText()" class="w-full accent-amber-400 bg-slate-800 h-2 rounded-lg cursor-pointer">
+                    </div>
+                </div>
+                <button onclick="fireTurret()" class="w-full py-4 px-4 bg-gradient-to-r from-amber-500 to-orange-500 text-black font-extrabold rounded-xl transition shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2 active:scale-95">
+                    <i data-lucide="zap" class="w-5 h-5 fill-black"></i> FIRE TURRET
+                </button>
+            </div>
+
+            <div class="grid grid-cols-2 gap-3 mt-1">
+                <div class="glass rounded-2xl p-4 border border-slate-800 bg-gradient-to-br from-indigo-500/5 to-transparent">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider mono flex items-center gap-1">
+                        <i data-lucide="flag" class="w-3 h-3 text-indigo-400"></i> Last Lap
+                    </span>
+                    <div class="text-xl font-extrabold text-indigo-400 mt-1 mono"><span id="last-lap">0.0</span><span class="text-[10px] text-slate-500">s</span></div>
+                </div>
+                
+                <div class="glass rounded-2xl p-4 border border-slate-800 bg-gradient-to-br from-yellow-500/5 to-transparent">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider mono flex items-center gap-1">
+                        <i data-lucide="database" class="w-3 h-3 text-yellow-400"></i> Best (DB)
+                    </span>
+                    <div class="text-xl font-extrabold text-yellow-400 mt-1 mono"><span id="fastest-lap">--</span></div>
+                </div>
+            </div>
+
+            <div class="glass rounded-2xl p-4 border border-slate-800 flex justify-between items-center">
+                <div>
+                    <span class="text-xs text-slate-400 uppercase tracking-wider mono">Treat Reservoir</span>
+                    <div class="text-2xl font-extrabold text-white mt-0.5 mono"><span id="treat-remaining">20</span><span class="text-slate-500 text-xs"> / 25</span></div>
+                </div>
+                <button onclick="refillTurret()" class="py-2 px-4 bg-slate-800 text-slate-300 text-xs font-semibold rounded-lg border border-slate-700 active:scale-95">REFILL</button>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        lucide.createIcons();
+        if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
+        
+        let audioCtx;
+        function initAudio() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        function playBeep(freq, duration) {
+            initAudio();
+            const oscillator = audioCtx.createOscillator();
+            const gainNode = audioCtx.createGain();
+            oscillator.type = 'sine';
+            oscillator.frequency.value = freq;
+            oscillator.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+            gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
+            oscillator.start();
+            setTimeout(() => oscillator.stop(), duration);
+        }
+
+        const ctx = document.getElementById('velocityChart').getContext('2d');
+        const velocityChart = new Chart(ctx, {
+            type: 'line',
+            data: { labels: Array(25).fill(''), datasets: [{ data: Array(25).fill(0), borderColor: '#10b981', borderWidth: 2, tension: 0.3, fill: true, backgroundColor: 'rgba(16, 185, 129, 0.08)', pointRadius: 0 }] },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { min: 0, max: 5, grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#64748b' } } } }
+        });
+
+        async function setTurretMode(mode) { 
+            initAudio();
+            await fetch('/api/turret/mode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode}) }); 
+        }
+        async function toggleHeatmap() { await fetch('/api/turret/heatmap', { method: 'POST' }); }
+        
+        function updateAimText() { 
+            document.getElementById('angle-val').innerText = `${document.getElementById('angle-slider').value}°`; 
+            document.getElementById('dist-val').innerText = `${document.getElementById('dist-slider').value} FT`; 
+        }
+        async function updateAim() { await fetch('/api/turret/aim', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({angle: document.getElementById('angle-slider').value, distance: document.getElementById('dist-slider').value}) }); }
+        async function fireTurret() { await fetch('/api/turret/fire', { method: 'POST' }); }
+        async function refillTurret() { await fetch('/api/turret/refill', { method: 'POST' }); }
+
+        let previousMode = 'MANUAL';
+
+        async function syncTelemetry() {
+            try {
+                const res = await fetch('/api/telemetry');
+                const data = await res.json();
+                const body = document.getElementById('app-body');
+                const badge = document.getElementById('mode-badge');
+                
+                if (data.turret_mode === 'AUTO_LURE' && previousMode === 'MANUAL') {
+                    playBeep(880, 150); 
+                    setTimeout(() => playBeep(1108, 250), 200); 
+                }
+                previousMode = data.turret_mode;
+                
+                if (data.night_mode) {
+                    body.classList.add('night-dim');
+                    badge.innerText = "NIGHT STANDBY MODE";
+                } else {
+                    body.classList.remove('night-dim');
+                    badge.innerHTML = data.turret_mode === 'AUTO_LURE' ? '<span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> AUTO LURE PATROL' : '<span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span> MANUAL AIM';
+                }
+
+                const barkIcon = document.getElementById('bark-icon');
+                if (data.bark_detected) {
+                    barkIcon.className = 'p-2.5 bg-yellow-500 border border-yellow-300 rounded-xl text-black shadow-lg shadow-yellow-500/50 scale-110 transition-all';
+                    barkIcon.innerHTML = '<i data-lucide="mic" class="w-6 h-6"></i>';
+                    lucide.createIcons();
+                } else {
+                    barkIcon.className = 'p-2.5 bg-cyan-500/10 border border-cyan-500/30 rounded-xl text-cyan-400 transition-all duration-500';
+                    barkIcon.innerHTML = '<i data-lucide="crosshair" class="w-6 h-6"></i>';
+                    lucide.createIcons();
+                }
+
+                document.getElementById('sys-cpu').innerText = data.cpu_usage + '%';
+                document.getElementById('sys-ram').innerText = data.ram_usage + '%';
+
+                document.getElementById('last-lap').innerText = data.last_lap_sec;
+                if (data.fastest_lap_sec !== 99.9) document.getElementById('fastest-lap').innerText = data.fastest_lap_sec + 's';
+                document.getElementById('treat-remaining').innerText = data.treats_remaining;
+
+                velocityChart.data.datasets[0].data.push(data.current_velocity_mps);
+                velocityChart.data.datasets[0].data.shift();
+                velocityChart.update('none');
+            } catch (e) {}
+        }
+        setInterval(syncTelemetry, 200);
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+if __name__ == '__main__':
+    init_db()
+    load_db_stats()
+    
+    t = threading.Thread(target=vision_thread_loop)
+    t.daemon = True
+    t.start()
+    
+    sys_thread = threading.Thread(target=system_monitor_thread)
+    sys_thread.daemon = True
+    sys_thread.start()
+    
+    if AUDIO_ENABLED:
+        audio_thread = threading.Thread(target=audio_monitor_thread)
+        audio_thread.daemon = True
+        audio_thread.start()
+
+    print("[+] PitPaws Titan Station running at http://0.0.0.0:5001")
+    app.run(host='0.0.0.0', port=5001, debug=False)
