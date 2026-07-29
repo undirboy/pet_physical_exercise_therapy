@@ -65,10 +65,9 @@ telemetry_state = {
     "hiit_step": 0,                  
     "hiit_next_action_time": 0.0,    
     "pet_detected_ai": False,        
-    "pet_detected_type": "None"      # NEW: Tracks "Dog" or "Cat"
+    "pet_detected_type": "None"
 }
 
-# NEW: Pet Profiles State
 pet_profiles = {
     "Dog": {"name": "Carbon", "birthday": ""},
     "Cat": {"name": "Kitty", "birthday": ""}
@@ -116,11 +115,9 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS daily_stats
                  (date TEXT PRIMARY KEY, top_speed REAL, fastest_lap REAL, falls INTEGER)''')
     
-    # Create Pet Profile Table
     c.execute('''CREATE TABLE IF NOT EXISTS profiles 
                  (species TEXT PRIMARY KEY, name TEXT, birthday TEXT)''')
     
-    # Insert Defaults if empty
     c.execute("INSERT OR IGNORE INTO profiles (species, name, birthday) VALUES ('Dog', 'Carbon', '')")
     c.execute("INSERT OR IGNORE INTO profiles (species, name, birthday) VALUES ('Cat', 'Kitty', '')")
     
@@ -139,7 +136,6 @@ def load_db_stats():
             telemetry_state["fastest_lap_sec"] = row[1]
             telemetry_state["fall_count"] = row[2]
             
-    # Load Profiles
     c.execute("SELECT species, name, birthday FROM profiles")
     for row in c.fetchall():
         with state_lock:
@@ -280,8 +276,10 @@ def vision_thread_loop():
     auto_fire_timer = time.time()
     frame_count = 0
     
-    pet_confirmed = False if ai_net else True
+    # [BUG FIX] AI Memory Trackers
+    last_pet_seen_time = 0.0
     current_pet_type = "None"
+    pet_confirmed = False if ai_net else True
     
     PIXEL_TO_METER_SCALE = 0.005
 
@@ -329,30 +327,31 @@ def vision_thread_loop():
             total_pixels = frame.shape[0] * frame.shape[1]
             motion_ratio = (motion_pixels / total_pixels) * 100.0
 
-            # YOLO SPECIES DETECTION
+            # YOLO SPECIES DETECTION WITH MEMORY DECAY
             if ai_net and motion_ratio > 0.5 and frame_count % 5 == 0:
                 blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
                 ai_net.setInput(blob)
                 detections = ai_net.forward()
-                
-                found_pet = False
-                p_type = "None"
                 
                 for i in range(detections.shape[2]):
                     confidence = detections[0, 0, i, 2]
                     if confidence > 0.4:
                         class_id = int(detections[0, 0, i, 1])
                         if class_id == 12: # Dog
-                            found_pet = True
-                            p_type = "Dog"
+                            last_pet_seen_time = now
+                            current_pet_type = "Dog"
                             break
                         elif class_id == 8: # Cat
-                            found_pet = True
-                            p_type = "Cat"
+                            last_pet_seen_time = now
+                            current_pet_type = "Cat"
                             break
-                            
-                pet_confirmed = found_pet
-                current_pet_type = p_type
+            
+            if ai_net:
+                # [BUG FIX] Pet identity decays after 2.0 seconds of no visual confirmation
+                pet_confirmed = (now - last_pet_seen_time) < 2.0
+                if not pet_confirmed:
+                    current_pet_type = "None"
+                    
                 with state_lock: 
                     telemetry_state["pet_detected_ai"] = pet_confirmed
                     telemetry_state["pet_detected_type"] = current_pet_type
@@ -496,7 +495,6 @@ def vision_thread_loop():
         cv2.putText(frame, f"DB LOGS | FALLS: {fall_val}", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
         if ai_net and ai_flag and p_type != "None":
-            # DYNAMIC CAMERA TEXT WITH CUSTOM NAME
             with state_lock: custom_name = pet_profiles.get(p_type, {}).get("name", p_type).upper()
             cv2.putText(frame, f"[{custom_name} ACQUIRED]", (500, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255) if p_type == 'Cat' else (255, 0, 255), 1)
 
@@ -917,7 +915,6 @@ HTML_TEMPLATE = """
                     camLabel.innerText = 'FIXED ROOM KINEMATICS FEED';
                 }
 
-                // AI IDENTITY BADGE
                 if (data.pet_detected_ai && data.pet_detected_type !== "None") {
                     let pType = data.pet_detected_type;
                     let pName = currentProfiles[pType] ? currentProfiles[pType].name.toUpperCase() : pType.toUpperCase();
