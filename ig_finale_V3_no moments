@@ -12,7 +12,7 @@ import math
 import psutil
 import urllib.request
 from datetime import date
-from flask import Flask, render_template_string, Response, jsonify, request, send_from_directory
+from flask import Flask, render_template_string, Response, jsonify, request
 
 try:
     import sounddevice as sd
@@ -34,10 +34,6 @@ BASELINE_SPEED_MPS = 3.5  # Assumed healthy sprint speed for limp detection
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'pitpaws_data.db')
-MOMENTS_DIR = os.path.join(BASE_DIR, 'moments')
-
-if not os.path.exists(MOMENTS_DIR):
-    os.makedirs(MOMENTS_DIR)
 
 telemetry_state = {
     "gait_asymmetry": 8.2,
@@ -59,7 +55,7 @@ telemetry_state = {
     "sleep_duration_sec": 0.0,
     "is_sleeping": False,
     "turret_mode": "MANUAL",
-    "camera_mode": "LAPTOP",          
+    "camera_mode": "LAPTOP",          # NEW: Optional camera toggle ("LAPTOP" or "360_PANORAMIC")
     "fetch_active": False,
     "fetch_start_time": 0.0,
     "last_lap_sec": 0.0,
@@ -351,12 +347,13 @@ def vision_thread_loop():
         with state_lock:
             cam_mode = telemetry_state.get("camera_mode", "LAPTOP")
 
+        # Dynamic adjustments based on camera option toggle
         if cam_mode == "360_PANORAMIC":
             frame = cv2.resize(frame, (1280, 640))
-            PIXEL_TO_METER_SCALE = 0.008  
+            PIXEL_TO_METER_SCALE = 0.008  # Scaled for wide fisheye lens
         else:
             frame = cv2.resize(frame, (640, 480))
-            PIXEL_TO_METER_SCALE = 0.005  
+            PIXEL_TO_METER_SCALE = 0.005  # Standard laptop webcam scale
 
         now = time.time()
         dt = now - last_tick_time
@@ -571,32 +568,6 @@ def toggle_camera_mode():
         telemetry_state["camera_mode"] = cam_mode
     return jsonify({"camera_mode": cam_mode})
 
-# NEW: MOMENTS SNAPSHOT ENDPOINT
-@app.route('/api/moments/capture', methods=['POST'])
-def capture_moment():
-    global output_frame
-    with frame_lock:
-        if output_frame is None:
-            return jsonify({"status": "error", "message": "No frame available"}), 400
-        frame_snapshot = output_frame.copy()
-    
-    filename = f"moment_{int(time.time())}.jpg"
-    filepath = os.path.join(MOMENTS_DIR, filename)
-    cv2.imwrite(filepath, frame_snapshot)
-    return jsonify({"status": "success", "filename": filename})
-
-@app.route('/moments/<filename>')
-def get_moment_file(filename):
-    return send_from_directory(MOMENTS_DIR, filename)
-
-@app.route('/api/moments/list')
-def list_moments():
-    try:
-        files = sorted([f for f in os.listdir(MOMENTS_DIR) if f.endswith('.jpg')], key=lambda x: os.path.getmtime(os.path.join(MOMENTS_DIR, x)), reverse=True)
-        return jsonify(files[:6]) # Return latest 6 snapshots
-    except:
-        return jsonify([])
-
 @app.route('/api/turret/aim', methods=['POST'])
 def aim_turret():
     data = request.get_json() or {}
@@ -701,29 +672,15 @@ HTML_TEMPLATE = """
 
     <main class="grid grid-cols-1 lg:grid-cols-3 gap-6">
         
-        <!-- LEFT COLUMN: Camera, Moments & Diagnostics -->
+        <!-- LEFT COLUMN: Camera & Diagnostics -->
         <div class="lg:col-span-2 space-y-6">
             
             <div id="video-container" class="glass rounded-2xl overflow-hidden relative border border-slate-800 glow-cyan transition-all duration-300">
                 <div class="absolute top-4 left-4 z-10 flex items-center gap-2 px-3 py-1 bg-black/70 backdrop-blur rounded-md text-[10px] sm:text-xs mono text-cyan-400 border border-cyan-500/30">
                     <i data-lucide="camera" class="w-3.5 h-3.5"></i> <span id="camera-label">FIXED KINEMATICS</span>
                 </div>
-                <!-- CAPTURE MOMENT BUTTON OVERLAY -->
-                <button onclick="captureMoment()" class="absolute top-4 right-4 z-10 flex items-center gap-1.5 px-3 py-1.5 bg-cyan-500/20 hover:bg-cyan-500/40 text-cyan-300 border border-cyan-500/40 rounded-lg text-xs font-bold transition active:scale-95 backdrop-blur">
-                    <i data-lucide="camera" class="w-4 h-4"></i> SNAP MOMENT
-                </button>
                 <div class="aspect-video bg-black flex items-center justify-center relative">
                     <img src="/video_feed" class="w-full h-full object-contain" alt="Kinematic Vision Feed">
-                </div>
-            </div>
-
-            <!-- MOMENTS GALLERY PREVIEW STRIP -->
-            <div class="glass rounded-2xl p-4 border border-slate-800">
-                <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                    <i data-lucide="image" class="w-4 h-4 text-cyan-400"></i> Captured Moments Gallery
-                </h3>
-                <div id="moments-strip" class="flex gap-3 overflow-x-auto no-scrollbar pb-1">
-                    <span class="text-xs text-slate-500 italic">No snapshots captured yet...</span>
                 </div>
             </div>
 
@@ -891,36 +848,6 @@ HTML_TEMPLATE = """
             await fetch('/api/camera/mode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({camera_mode: camMode}) });
         }
 
-        async function captureMoment() {
-            try {
-                const res = await fetch('/api/moments/capture', { method: 'POST' });
-                const data = await res.json();
-                if (data.status === 'success') {
-                    loadMomentsGallery();
-                }
-            } catch(e) {}
-        }
-
-        async function loadMomentsGallery() {
-            try {
-                const res = await fetch('/api/moments/list');
-                const files = await res.json();
-                const strip = document.getElementById('moments-strip');
-                if (files.length === 0) {
-                    strip.innerHTML = '<span class="text-xs text-slate-500 italic">No snapshots captured yet...</span>';
-                    return;
-                }
-                strip.innerHTML = files.map(f => `
-                    <div class="relative flex-shrink-0 w-24 h-16 rounded-lg overflow-hidden border border-slate-700 bg-black group">
-                        <img src="/moments/${f}" class="w-full h-full object-cover">
-                        <a href="/moments/${f}" target="_blank" class="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center text-white text-[10px] font-bold transition">View</a>
-                    </div>
-                `).join('');
-            } catch(e) {}
-        }
-        loadMomentsGallery();
-        setInterval(loadMomentsGallery, 5000); // Refresh gallery every 5s
-
         function updateAimText() { 
             document.getElementById('angle-val').innerText = `${document.getElementById('angle-slider').value}°`; 
             document.getElementById('dist-val').innerText = `${document.getElementById('dist-slider').value} FT`; 
@@ -1080,5 +1007,5 @@ if __name__ == '__main__':
     if AUDIO_ENABLED:
         threading.Thread(target=audio_monitor_thread, daemon=True).start()
 
-    print("[+] PitPaws Titan Station v5.3 running at http://0.0.0.0:5001")
+    print("[+] PitPaws Titan Station v5.2 running at http://0.0.0.0:5001")
     app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
