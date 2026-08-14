@@ -30,7 +30,7 @@ state_lock = threading.RLock()
 frame_lock = threading.Lock()
 
 MAX_TREAT_CAPACITY = 25
-BASELINE_SPEED_MPS = 3.5  # Assumed healthy sprint speed for limp detection
+BASELINE_SPEED_MPS = 3.5  
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'pitpaws_data.db')
@@ -39,6 +39,7 @@ telemetry_state = {
     "gait_asymmetry": 8.2,
     "prev_day_asymmetry": 18.5,
     "limp_delta": 0.0,               
+    "limp_trend": 0.0,               
     "current_velocity_mps": 0.0,
     "current_stride_length_m": 0.0,  
     "top_sprint_mps": 0.0,
@@ -55,7 +56,7 @@ telemetry_state = {
     "sleep_duration_sec": 0.0,
     "is_sleeping": False,
     "turret_mode": "MANUAL",
-    "camera_mode": "LAPTOP",          # NEW: Optional camera toggle ("LAPTOP" or "360_PANORAMIC")
+    "camera_mode": "LAPTOP",          
     "fetch_active": False,
     "fetch_start_time": 0.0,
     "last_lap_sec": 0.0,
@@ -115,7 +116,7 @@ def init_ai_model():
 ai_net = init_ai_model()
 
 # ==========================================
-# 3. SQLITE DATABASE
+# 3. SQLITE DATABASE (ROBUST WITH RETRY)
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -126,6 +127,11 @@ def init_db():
         c.execute("ALTER TABLE daily_stats ADD COLUMN treats INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
+    try:
+        c.execute("ALTER TABLE daily_stats ADD COLUMN limp_delta_val REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
+        
     c.execute('''CREATE TABLE IF NOT EXISTS profiles 
                  (species TEXT PRIMARY KEY, name TEXT, birthday TEXT)''')
     c.execute("INSERT OR IGNORE INTO profiles (species, name, birthday) VALUES ('Dog', 'Carbon', '')")
@@ -139,7 +145,7 @@ def load_db_stats():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
     try:
-        c.execute("SELECT top_speed, fastest_lap, falls, treats FROM daily_stats WHERE date=?", (today,))
+        c.execute("SELECT top_speed, fastest_lap, falls, treats, limp_delta_val FROM daily_stats WHERE date=?", (today,))
         row = c.fetchone()
         if row:
             with state_lock:
@@ -147,8 +153,15 @@ def load_db_stats():
                 telemetry_state["fastest_lap_sec"] = row[1]
                 telemetry_state["fall_count"] = row[2]
                 telemetry_state["treats_dispensed_today"] = row[3] if row[3] is not None else 0
-    except:
-        pass
+                telemetry_state["limp_delta"] = row[4] if row[4] is not None else 0.0
+                
+        c.execute("SELECT limp_delta_val FROM daily_stats WHERE date < ? ORDER BY date DESC LIMIT 1", (today,))
+        prev_row = c.fetchone()
+        if prev_row and prev_row[0] is not None:
+            with state_lock:
+                telemetry_state["prev_day_asymmetry"] = prev_row[0]
+    except Exception as e:
+        print(f"[-] Error loading DB stats: {e}")
             
     c.execute("SELECT species, name, birthday FROM profiles")
     for row in c.fetchall():
@@ -163,22 +176,46 @@ def update_db_stats():
         lap = telemetry_state["fastest_lap_sec"]
         falls = telemetry_state["fall_count"]
         treats = telemetry_state["treats_dispensed_today"]
-        
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO daily_stats (date, top_speed, fastest_lap, falls, treats) VALUES (?, ?, ?, ?, ?)", 
-              (today, top, lap, falls, treats))
-    conn.commit()
-    conn.close()
+        limp_val = telemetry_state["limp_delta"]
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute("""INSERT OR REPLACE INTO daily_stats (date, top_speed, fastest_lap, falls, treats, limp_delta_val) 
+                         VALUES (?, ?, ?, ?, ?, ?)""", 
+                      (today, top, lap, falls, treats, limp_val))
+            conn.commit()
+            conn.close()
+            break
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                time.sleep(0.1 * (attempt + 1))
+            else:
+                print(f"[-] Database Error in update_db_stats: {e}")
+        except Exception as e:
+            print(f"[-] Unexpected DB Error: {e}")
+            break
 
 def update_pet_profile_db(species, name, birthday):
     with state_lock:
         pet_profiles[species] = {"name": name, "birthday": birthday}
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO profiles (species, name, birthday) VALUES (?, ?, ?)", (species, name, birthday))
-    conn.commit()
-    conn.close()
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO profiles (species, name, birthday) VALUES (?, ?, ?)", (species, name, birthday))
+            conn.commit()
+            conn.close()
+            break
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                time.sleep(0.1)
+            else:
+                print(f"[-] Database Error in update_pet_profile_db: {e}")
+                break
 
 # ==========================================
 # 4. BACKGROUND THREADS
@@ -331,7 +368,6 @@ def vision_thread_loop():
     
     last_pet_seen_time = 0.0
     current_pet_type = "None"
-    pet_confirmed = False if ai_net else True
 
     while True:
         if not cap.isOpened():
@@ -347,13 +383,12 @@ def vision_thread_loop():
         with state_lock:
             cam_mode = telemetry_state.get("camera_mode", "LAPTOP")
 
-        # Dynamic adjustments based on camera option toggle
         if cam_mode == "360_PANORAMIC":
             frame = cv2.resize(frame, (1280, 640))
-            PIXEL_TO_METER_SCALE = 0.008  # Scaled for wide fisheye lens
+            PIXEL_TO_METER_SCALE = 0.008  
         else:
             frame = cv2.resize(frame, (640, 480))
-            PIXEL_TO_METER_SCALE = 0.005  # Standard laptop webcam scale
+            PIXEL_TO_METER_SCALE = 0.005  
 
         now = time.time()
         dt = now - last_tick_time
@@ -385,31 +420,18 @@ def vision_thread_loop():
                 ai_net.setInput(blob)
                 detections = ai_net.forward()
                 
+                detected_any = False
                 for i in range(detections.shape[2]):
                     confidence = detections[0, 0, i, 2]
                     if confidence > 0.4:
                         class_id = int(detections[0, 0, i, 1])
-                        if class_id == 12: # Dog
+                        if class_id in [8, 12, 15]:
                             last_pet_seen_time = now
-                            current_pet_type = "Dog"
+                            current_pet_type = "Dog" if class_id == 12 else ("Cat" if class_id == 8 else "Human")
+                            detected_any = True
                             break
-                        elif class_id == 8: # Cat
-                            last_pet_seen_time = now
-                            current_pet_type = "Cat"
-                            break
-                        elif class_id == 15: # Person/Human
-                            last_pet_seen_time = now
-                            current_pet_type = "Human"
-                            break
-            
-            if ai_net:
-                pet_confirmed = (now - last_pet_seen_time) < 2.0
-                if not pet_confirmed:
-                    current_pet_type = "None"
-                    
-                with state_lock: 
-                    telemetry_state["pet_detected_ai"] = pet_confirmed
-                    telemetry_state["pet_detected_type"] = current_pet_type
+                if not detected_any and (now - last_pet_seen_time) > 2.0:
+                    current_pet_type = "Motion Target"
 
             with state_lock:
                 if motion_ratio < 0.8:
@@ -421,16 +443,16 @@ def vision_thread_loop():
                     inactivity_start_time = None
                     telemetry_state["is_sleeping"] = False
 
-                if motion_ratio > 35.0 and pet_confirmed and (now - last_fall_time > 4.0):
+                if motion_ratio > 35.0 and (now - last_fall_time > 4.0):
                     telemetry_state["fall_count"] += 1
                     last_fall_time = now
                     trigger_db_update = True
 
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            if contours and pet_confirmed:
+            if contours:
                 largest_cnt = max(contours, key=cv2.contourArea)
-                if cv2.contourArea(largest_cnt) > 800:
+                if cv2.contourArea(largest_cnt) > 150:
                     M = cv2.moments(largest_cnt)
                     if M["m00"] != 0:
                         curr_center_x = int(M["m10"] / M["m00"])
@@ -441,7 +463,7 @@ def vision_thread_loop():
                             
                             if velocity_mps < 15.0:
                                 stride = 0.0
-                                if velocity_mps > 0.5:
+                                if velocity_mps > 0.2:
                                     simulated_step_freq = 2.0 + (velocity_mps * 0.2)
                                     stride = round(velocity_mps / simulated_step_freq, 2)
 
@@ -452,7 +474,7 @@ def vision_thread_loop():
                                     if velocity_mps > telemetry_state["top_sprint_mps"]:
                                         telemetry_state["top_sprint_mps"] = velocity_mps
                                         trigger_db_update = True
-                                    if velocity_mps > 0.2:
+                                    if velocity_mps > 0.1:
                                         telemetry_state["sprint_sum"] += velocity_mps
                                         telemetry_state["sprint_count"] += 1
                                         telemetry_state["avg_sprint_mps"] = round(telemetry_state["sprint_sum"] / telemetry_state["sprint_count"], 2)
@@ -460,6 +482,7 @@ def vision_thread_loop():
                                         if telemetry_state["avg_sprint_mps"] > 0:
                                             delta = ((telemetry_state["avg_sprint_mps"] - BASELINE_SPEED_MPS) / BASELINE_SPEED_MPS) * 100
                                             telemetry_state["limp_delta"] = round(delta, 1)
+                                            telemetry_state["limp_trend"] = round(telemetry_state["limp_delta"] - telemetry_state["prev_day_asymmetry"], 1)
 
                                         if velocity_mps < telemetry_state["min_sprint_mps"]: 
                                             telemetry_state["min_sprint_mps"] = velocity_mps
@@ -486,13 +509,8 @@ def vision_thread_loop():
         prev_gray = curr_gray
 
         with state_lock:
-            velocity_val = telemetry_state['current_velocity_mps']
-            mode_val = telemetry_state['turret_mode']
-            fall_val = telemetry_state['fall_count']
-            night = telemetry_state['night_mode']
             angle_val = telemetry_state['turret_angle_deg']
             dist_val = telemetry_state['launch_distance_ft']
-            stride_val = telemetry_state['current_stride_length_m']
 
         cam_bottom_x = int(frame.shape[1] / 2)
         cam_bottom_y = frame.shape[0] - 10
@@ -661,8 +679,11 @@ HTML_TEMPLATE = """
             <div class="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-[10px] mono">
                 <i data-lucide="clock" class="w-3 h-3"></i> <span id="clock-display">--:--:--</span>
             </div>
+            <button onclick="openPetModal()" class="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-[10px] hover:bg-slate-700 transition">
+                <i data-lucide="users" class="w-3 h-3"></i> PROFILES
+            </button>
             <div id="ai-badge" class="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-purple-500/10 border border-purple-500/20 text-purple-400 text-[10px] mono">
-                <i data-lucide="brain" class="w-3 h-3"></i> AI OFFLINE
+                <i data-lucide="brain" class="w-3 h-3"></i> KINEMATICS ACTIVE
             </div>
             <div id="mode-badge" class="flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 text-[10px] sm:text-xs font-semibold">
                 MANUAL MODE
@@ -672,7 +693,6 @@ HTML_TEMPLATE = """
 
     <main class="grid grid-cols-1 lg:grid-cols-3 gap-6">
         
-        <!-- LEFT COLUMN: Camera & Diagnostics -->
         <div class="lg:col-span-2 space-y-6">
             
             <div id="video-container" class="glass rounded-2xl overflow-hidden relative border border-slate-800 glow-cyan transition-all duration-300">
@@ -684,7 +704,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- LIMP DIAGNOSTICS PANEL -->
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div id="limp-alert-box" class="glass rounded-2xl p-5 border border-slate-800 text-center transition-all duration-500">
                     <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 flex items-center justify-center gap-2">
@@ -692,6 +711,7 @@ HTML_TEMPLATE = """
                     </h3>
                     <div id="limp-status-text" class="text-emerald-400 font-bold text-xl mt-2 transition-all">✓ GAIT NORMAL</div>
                     <div class="text-xs text-slate-400 mt-2 mono">Baseline Delta: <span id="limp-delta-val" class="font-bold">0.0%</span></div>
+                    <div class="text-[11px] text-slate-400 mt-1 mono">vs Previous Day: <span id="limp-trend-val" class="font-bold">0.0%</span></div>
                 </div>
 
                 <div class="glass rounded-2xl p-5 border border-slate-800 hidden md:block">
@@ -708,10 +728,8 @@ HTML_TEMPLATE = """
             
         </div>
 
-        <!-- RIGHT COLUMN: Controls & Speeds -->
         <div class="space-y-4">
             
-            <!-- OPTIONAL CAMERA TOGGLE -->
             <div class="glass rounded-2xl p-4 border border-slate-800 text-center">
                 <span class="text-xs text-slate-400 uppercase tracking-wider mono flex items-center justify-center gap-1.5 mb-2">
                     <i data-lucide="video" class="w-4 h-4 text-cyan-400"></i> Camera Hardware Option
@@ -809,6 +827,9 @@ HTML_TEMPLATE = """
                 <button onclick="refillTurret()" class="py-2 px-4 bg-slate-800 text-slate-300 text-xs font-semibold rounded-lg border border-slate-700 active:scale-95">REFILL</button>
             </div>
             
+            <button onclick="openPetModal()" class="w-full py-3 rounded-xl border border-slate-700 bg-slate-800 text-slate-300 font-semibold text-xs transition active:scale-95 flex items-center justify-center gap-2">
+                <i data-lucide="users" class="w-4 h-4"></i> MANAGE PROFILES
+            </button>
         </div>
     </main>
 
@@ -829,6 +850,26 @@ HTML_TEMPLATE = """
             } catch(e) {}
         }
         loadProfiles();
+
+        function openPetModal() {
+            document.getElementById('dog-name').value = currentProfiles.Dog.name;
+            document.getElementById('cat-name').value = currentProfiles.Cat.name;
+            document.getElementById('human-name').value = currentProfiles.Human.name;
+            document.getElementById('pet-modal').classList.remove('hidden');
+        }
+        function closePetModal() { document.getElementById('pet-modal').classList.add('hidden'); }
+        async function savePetProfiles() {
+            const payload = {
+                Dog: { name: document.getElementById('dog-name').value, birthday: '' },
+                Cat: { name: document.getElementById('cat-name').value, birthday: '' },
+                Human: { name: document.getElementById('human-name').value, birthday: '' }
+            };
+            try {
+                await fetch('/api/profiles', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+                currentProfiles = payload;
+                closePetModal();
+            } catch(e) {}
+        }
 
         let velocityChart = null;
         try {
@@ -930,22 +971,6 @@ HTML_TEMPLATE = """
                     camLabel.innerText = data.camera_mode === '360_PANORAMIC' ? '360° PANORAMIC FEED' : 'LAPTOP WEBCAM FEED';
                 }
 
-                if (data.pet_detected_ai && data.pet_detected_type !== "None") {
-                    let pType = data.pet_detected_type;
-                    let pName = currentProfiles[pType] ? currentProfiles[pType].name.toUpperCase() : pType.toUpperCase();
-                    let iconColor = pType === 'Cat' ? 'text-amber-400' : (pType === 'Human' ? 'text-emerald-400' : 'text-cyan-400');
-                    let borderColor = pType === 'Cat' ? 'border-amber-500/50 bg-amber-500/20' : (pType === 'Human' ? 'border-emerald-500/50 bg-emerald-500/20' : 'border-cyan-500/50 bg-cyan-500/20');
-                    let iconName = pType === 'Human' ? 'user' : 'brain';
-                    
-                    aiBadge.innerHTML = `<i data-lucide="${iconName}" class="w-3 h-3"></i> AI: ${pName} ACQUIRED`;
-                    aiBadge.className = `hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-full ${borderColor} ${iconColor} text-[10px] mono`;
-                    try { if (typeof lucide !== 'undefined') lucide.createIcons(); } catch(e){}
-                } else {
-                    aiBadge.innerHTML = '<i data-lucide="brain" class="w-3 h-3"></i> AI: SEARCHING...';
-                    aiBadge.className = 'hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-400 text-[10px] mono';
-                    try { if (typeof lucide !== 'undefined') lucide.createIcons(); } catch(e){}
-                }
-
                 document.getElementById('metric-top-speed').innerText = data.top_sprint_mps;
                 document.getElementById('metric-avg-speed').innerText = data.avg_sprint_mps;
                 document.getElementById('metric-min-speed').innerText = data.min_sprint_mps === 99.9 ? '0.0' : data.min_sprint_mps;
@@ -963,6 +988,13 @@ HTML_TEMPLATE = """
                 if (treatsDispensedEl) treatsDispensedEl.innerText = data.treats_dispensed_today;
                 
                 document.getElementById('limp-delta-val').innerText = data.limp_delta + "%";
+                const trendVal = data.limp_trend;
+                const trendEl = document.getElementById('limp-trend-val');
+                if (trendEl) {
+                    trendEl.innerText = (trendVal > 0 ? "+" : "") + trendVal + "%";
+                    trendEl.className = trendVal > 0 ? "text-red-400 font-bold" : "text-emerald-400 font-bold";
+                }
+
                 const limpBox = document.getElementById('limp-alert-box');
                 const limpText = document.getElementById('limp-status-text');
                 
@@ -1007,5 +1039,5 @@ if __name__ == '__main__':
     if AUDIO_ENABLED:
         threading.Thread(target=audio_monitor_thread, daemon=True).start()
 
-    print("[+] PitPaws Titan Station v5.2 running at http://0.0.0.0:5001")
+    print("[+] PitPaws Titan Station v5.7 running at http://0.0.0.0:5001")
     app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
