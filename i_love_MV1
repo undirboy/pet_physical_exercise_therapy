@@ -1,0 +1,1513 @@
+import cv2
+import time
+import threading
+import platform
+import random
+import numpy as np
+import serial
+import serial.tools.list_ports
+import os
+import sqlite3
+import math
+import psutil
+import urllib.request
+import datetime
+from datetime import date
+from flask import Flask, render_template_string, Response, jsonify, request, session, redirect, url_for
+
+try:
+    import sounddevice as sd
+    AUDIO_ENABLED = True
+except ImportError:
+    AUDIO_ENABLED = False
+    print("[-] sounddevice not installed. Audio Lure disabled.")
+
+# ==========================================
+# 1. FLASK APP, SYSTEM STATE & PATHS
+# ==========================================
+app = Flask(__name__)
+app.secret_key = os.environ.get("PITPAWS_SECRET_KEY", os.urandom(24).hex())
+
+# Authentication Credentials
+AUTH_USER = "aatriv"
+AUTH_PASS = "carbon"
+
+state_lock = threading.RLock()
+frame_lock = threading.Lock()
+
+MAX_TREAT_CAPACITY = 25
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'pitpaws_data.db')
+
+telemetry_state = {
+    "active_baseline_mps": 3.5, 
+    "gait_asymmetry": 8.2,
+    "prev_day_asymmetry": 18.5,
+    "limp_delta": 0.0,                
+    "limp_trend": 0.0,                
+    "current_velocity_mps": 0.0,
+    "current_stride_length_m": 0.0,  
+    "top_sprint_mps": 0.0,
+    "avg_sprint_mps": 0.0,
+    "min_sprint_mps": 99.9,
+    "sprint_sum": 0.0,
+    "sprint_count": 0,
+    "turret_angle_deg": 90,
+    "launch_distance_ft": 6,
+    "treats_remaining": 25,
+    "treats_dispensed_today": 0,
+    "treat_level_pct": 100,
+    "fall_count": 0,
+    "sleep_duration_sec": 0.0,
+    "is_sleeping": 0,          
+    "turret_mode": "MANUAL",
+    "camera_mode": "LAPTOP",   
+    "fetch_active": 0,         
+    "fetch_start_time": 0.0,
+    "last_lap_sec": 0.0,
+    "fastest_lap_sec": 99.9,
+    "night_mode": 0,            
+    "bark_detected": 0,        
+    "cpu_usage": 0.0,        
+    "ram_usage": 0.0,
+    "is_pre_launch": 0,        
+    "pre_launch_timer": 0.0,         
+    "hiit_step": 0,                  
+    "hiit_next_action_time": 0.0,    
+    "pet_detected_ai": 0,      
+    "pet_detected_type": "None",
+    "security_mode": False,
+    "security_alert_triggered": False,
+    "cognitive_reaction_time_sec": 0.0,
+    "expected_reaction_sec": 0.5, 
+    "waiting_for_reaction": False,
+    "buzzer_timestamp": 0.0
+}
+
+pet_profiles = {
+    "Dog": {"name": "Carbon", "birthday": "", "breed": "", "weight": 0.0},
+    "Cat": {"name": "Kitty", "birthday": "", "breed": "", "weight": 0.0},
+    "Human": {"name": "Owner", "birthday": "", "breed": "", "weight": 0.0}
+}
+
+output_frame = None
+last_security_alert_time = 0.0
+
+# ==========================================
+# 2. NEURAL NETWORK AUTO-DOWNLOADER
+# ==========================================
+def init_ai_model():
+    proto = os.path.join(BASE_DIR, "MobileNetSSD.prototxt")
+    model = os.path.join(BASE_DIR, "MobileNetSSD.caffemodel")
+    
+    if os.path.exists(proto) and os.path.exists(model):
+        try:
+            net = cv2.dnn.readNetFromCaffe(proto, model)
+            print("[+] Neural Network Entity Detection Loaded from local files.")
+            return net
+        except Exception:
+            pass
+
+    print("[*] Downloading MobileNet-SSD AI Models...")
+    try:
+        urllib.request.urlretrieve("https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/voc/MobileNetSSD_deploy.prototxt", proto)
+        urllib.request.urlretrieve("https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/voc/MobileNetSSD_deploy.caffemodel", model)
+        
+        if os.path.getsize(model) < 1000000:
+            if os.path.exists(proto): os.remove(proto)
+            if os.path.exists(model): os.remove(model)
+            return None
+            
+        net = cv2.dnn.readNetFromCaffe(proto, model)
+        print("[+] Neural Network Entity Detection Loaded.")
+        return net
+    except Exception as e:
+        print(f"[-] AI Download failed: {e}. Running on standard motion tracking.")
+        return None
+
+ai_net = init_ai_model()
+
+# ==========================================
+# 3. SQLITE DATABASE & CALIBRATION ENGINE
+# ==========================================
+def init_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_stats (date TEXT PRIMARY KEY, top_speed REAL, fastest_lap REAL, falls INTEGER)''')
+    try: c.execute("ALTER TABLE daily_stats ADD COLUMN treats INTEGER DEFAULT 0")
+    except: pass
+    try: c.execute("ALTER TABLE daily_stats ADD COLUMN limp_delta_val REAL DEFAULT 0.0")
+    except: pass
+        
+    c.execute('''CREATE TABLE IF NOT EXISTS telemetry_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, event_type TEXT, details TEXT)''')
+        
+    c.execute('''CREATE TABLE IF NOT EXISTS profiles (species TEXT PRIMARY KEY, name TEXT, birthday TEXT)''')
+    try: c.execute("ALTER TABLE profiles ADD COLUMN breed TEXT DEFAULT ''")
+    except: pass
+    try: c.execute("ALTER TABLE profiles ADD COLUMN weight REAL DEFAULT 0.0")
+    except: pass
+    
+    c.execute("INSERT OR IGNORE INTO profiles (species, name, birthday, breed, weight) VALUES ('Dog', 'Carbon', '', '', 0.0)")
+    c.execute("INSERT OR IGNORE INTO profiles (species, name, birthday, breed, weight) VALUES ('Cat', 'Kitty', '', '', 0.0)")
+    c.execute("INSERT OR IGNORE INTO profiles (species, name, birthday, breed, weight) VALUES ('Human', 'Owner', '', '', 0.0)")
+    conn.commit()
+    conn.close()
+
+def update_dynamic_baseline():
+    dog = pet_profiles.get("Dog", {})
+    breed = str(dog.get("breed", "")).lower()
+    bday = dog.get("birthday", "")
+    weight = float(dog.get("weight", 0.0) or 0.0)
+
+    breed_speeds = {"greyhound": 8.0, "border collie": 6.5, "labrador": 5.0, "retriever": 4.5, "bulldog": 2.5, "pug": 2.0}
+    base_spd = 3.5 
+    base_rx = 0.5  
+    
+    for k, v in breed_speeds.items():
+        if k in breed:
+            base_spd = v
+            break
+
+    try:
+        if bday:
+            b_year = int(bday.split("-")[0])
+            age = date.today().year - b_year
+            if age >= 8: 
+                base_spd *= 0.85
+                base_rx += 0.4 
+            elif age >= 5:
+                base_rx += 0.2
+    except: pass
+
+    if weight > 35.0:
+        base_spd *= 0.90
+
+    with state_lock:
+        telemetry_state["active_baseline_mps"] = round(base_spd, 2)
+        telemetry_state["expected_reaction_sec"] = round(base_rx, 2)
+
+def load_db_stats():
+    today = str(date.today())
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT top_speed, fastest_lap, falls, treats, limp_delta_val FROM daily_stats WHERE date=?", (today,))
+        row = c.fetchone()
+        if row:
+            with state_lock:
+                telemetry_state["top_sprint_mps"] = row[0]
+                telemetry_state["fastest_lap_sec"] = row[1]
+                telemetry_state["fall_count"] = row[2] if row[2] is not None else 0
+                telemetry_state["treats_dispensed_today"] = row[3] if row[3] is not None else 0
+                telemetry_state["limp_delta"] = row[4] if row[4] is not None else 0.0
+                
+        c.execute("SELECT limp_delta_val FROM daily_stats WHERE date < ? ORDER BY date DESC LIMIT 1", (today,))
+        prev_row = c.fetchone()
+        if prev_row and prev_row[0] is not None:
+            with state_lock:
+                telemetry_state["prev_day_asymmetry"] = prev_row[0]
+    except Exception:
+        pass
+        
+    try:
+        c.execute("SELECT species, name, birthday, breed, weight FROM profiles")
+        for row in c.fetchall():
+            with state_lock:
+                pet_profiles[row[0]] = {"name": row[1], "birthday": row[2], "breed": row[3], "weight": row[4]}
+    except Exception:
+        pass
+    conn.close()
+    update_dynamic_baseline()
+
+def update_db_stats():
+    today = str(date.today())
+    with state_lock:
+        top = telemetry_state["top_sprint_mps"]
+        lap = telemetry_state["fastest_lap_sec"]
+        falls = telemetry_state["fall_count"]
+        treats = telemetry_state["treats_dispensed_today"]
+        limp_val = telemetry_state["limp_delta"]
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        conn = None
+        try:
+            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute("""INSERT OR REPLACE INTO daily_stats (date, top_speed, fastest_lap, falls, treats, limp_delta_val) 
+                         VALUES (?, ?, ?, ?, ?, ?)""", (today, top, lap, falls, treats, limp_val))
+            conn.commit()
+            break
+        except sqlite3.OperationalError: time.sleep(0.1)
+        except Exception: break
+        finally:
+            if conn is not None:
+                conn.close()
+
+def update_pet_profile_db(species, name, birthday, breed="", weight=0.0):
+    with state_lock:
+        pet_profiles[species] = {"name": name, "birthday": birthday, "breed": breed, "weight": weight}
+    
+    max_retries = 5
+    for attempt in range(max_retries):
+        conn = None
+        try:
+            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO profiles (species, name, birthday, breed, weight) VALUES (?, ?, ?, ?, ?)", 
+                      (species, name, birthday, breed, weight))
+            conn.commit()
+            if species == "Dog": update_dynamic_baseline()
+            break
+        except sqlite3.OperationalError: time.sleep(0.1)
+        except Exception: break
+        finally:
+            if conn is not None:
+                conn.close()
+
+# ==========================================
+# 4. BACKGROUND MONITORING THREADS
+# ==========================================
+def audio_monitor_thread():
+    if not AUDIO_ENABLED: return
+    def audio_callback(indata, frames, time_info, status):
+        audio_data = indata[:, 0]
+        fft_data = np.abs(np.fft.rfft(audio_data))
+        freqs = np.fft.rfftfreq(len(audio_data), 1.0/44100)
+        volume_norm = np.linalg.norm(audio_data) * 10
+        if volume_norm > 40.0:
+            dominant_freq = freqs[np.argmax(fft_data)]
+            if 500 < dominant_freq < 3000:
+                with state_lock: telemetry_state["bark_detected"] = 1
+    try:
+        with sd.InputStream(callback=audio_callback, samplerate=44100, channels=1):
+            while True:
+                time.sleep(0.1) 
+                if telemetry_state["bark_detected"]:
+                    time.sleep(1.0) 
+                    with state_lock: telemetry_state["bark_detected"] = 0
+    except Exception: pass
+
+def system_monitor_thread():
+    while True:
+        cpu_usage = psutil.cpu_percent(interval=1)
+        ram_usage = psutil.virtual_memory().percent
+        with state_lock:
+            telemetry_state["cpu_usage"] = cpu_usage
+            telemetry_state["ram_usage"] = ram_usage
+        time.sleep(2)
+
+# ==========================================
+# 5. HARDWARE TURRET & 3-CAM ROUTER
+# ==========================================
+def get_universal_arduino_port():
+    for port in serial.tools.list_ports.comports():
+        desc = port.description.lower()
+        device = port.device.lower()
+        if "arduino" in desc or "ch340" in desc or "cp210" in desc or "usbmodem" in device or "ttyacm" in device or "ttyusb" in device:
+            return port.device
+    return None
+
+arduino_port = get_universal_arduino_port()
+if arduino_port:
+    try: arduino = serial.Serial(arduino_port, 9600, timeout=1, write_timeout=0)
+    except Exception: arduino = None
+else: arduino = None
+
+def get_camera_for_mode(cam_mode):
+    os_name = platform.system()
+    target_indices = [2, 1, 0] if cam_mode == "360_PANORAMIC" else ([1, 2, 0] if cam_mode == "EXTENDED" else [0, 1, 2])
+
+    for idx in target_indices:
+        cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION if os_name == "Darwin" else (cv2.CAP_DSHOW if os_name == "Windows" else cv2.CAP_V4L2))
+        if cap is not None and cap.isOpened():
+            ret, test_frame = cap.read()
+            if ret and test_frame is not None:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280 if cam_mode == "360_PANORAMIC" else 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 640 if cam_mode == "360_PANORAMIC" else 480)
+                return cap
+            else: cap.release()
+    return cv2.VideoCapture(0)
+
+def fire_hardware_turret():
+    global arduino, telemetry_state
+    if arduino:
+        cmd = f"FIRE:{telemetry_state['turret_angle_deg']}:{telemetry_state['launch_distance_ft']}\n"
+        try: arduino.write(cmd.encode())
+        except: pass
+
+def trigger_launch_sequence(angle, distance, is_auto=False):
+    with state_lock:
+        if telemetry_state["treats_remaining"] > 0:
+            telemetry_state["turret_angle_deg"] = angle
+            telemetry_state["launch_distance_ft"] = distance
+            if is_auto:
+                if not telemetry_state["is_pre_launch"]:
+                    telemetry_state["is_pre_launch"] = 1
+                    telemetry_state["pre_launch_timer"] = time.time()
+                    
+                    telemetry_state["buzzer_timestamp"] = time.time()
+                    telemetry_state["waiting_for_reaction"] = True
+            else:
+                telemetry_state["treats_remaining"] -= 1
+                telemetry_state["treats_dispensed_today"] += 1
+                telemetry_state["fetch_active"] = 1
+                telemetry_state["fetch_start_time"] = time.time()
+                fire_hardware_turret()
+
+def turret_logic_thread():
+    auto_fire_timer = time.time()
+    while True:
+        now = time.time()
+        trigger_db_update = False
+        with state_lock:
+            if telemetry_state["is_pre_launch"]:
+                if now - telemetry_state["pre_launch_timer"] > 3.0:
+                    telemetry_state["is_pre_launch"] = 0
+                    if telemetry_state["treats_remaining"] > 0:
+                        telemetry_state["treats_remaining"] -= 1
+                        telemetry_state["treats_dispensed_today"] += 1
+                        telemetry_state["fetch_active"] = 1
+                        telemetry_state["fetch_start_time"] = now
+                        fire_hardware_turret()
+                    auto_fire_timer = now 
+                    trigger_db_update = True
+
+            if not telemetry_state["is_pre_launch"]:
+                mode = telemetry_state["turret_mode"]
+                if mode == "AUTO_LURE":
+                    if telemetry_state["bark_detected"] and (now - auto_fire_timer > 3.0): 
+                        trigger_launch_sequence(random.randint(30, 150), random.randint(4, 9), is_auto=True)
+                    elif not telemetry_state["is_sleeping"] and (now - auto_fire_timer > 8.0): 
+                        trigger_launch_sequence(random.randint(30, 150), random.randint(4, 9), is_auto=True)
+                elif mode == "HIIT_ROUTINE":
+                    if now > telemetry_state["hiit_next_action_time"]:
+                        dist = 3 if telemetry_state["hiit_step"] % 2 == 0 else 10
+                        telemetry_state["hiit_step"] += 1
+                        telemetry_state["hiit_next_action_time"] = now + 10.0 
+                        trigger_launch_sequence(90, dist, is_auto=True)
+
+            if telemetry_state["fetch_active"] and (now - telemetry_state["fetch_start_time"] > 20.0):
+                telemetry_state["fetch_active"] = 0
+
+        if trigger_db_update: update_db_stats()
+        time.sleep(0.1)
+
+# ==========================================
+# 6. VISION ENGINE (WITH AI HUD & ACTIVE LAP TIMER)
+# ==========================================
+def vision_thread_loop():
+    global output_frame, telemetry_state, last_security_alert_time
+    current_cam_mode = "LAPTOP"
+    cap = get_camera_for_mode(current_cam_mode)
+    
+    prev_gray = None
+    inactivity_start_time = None
+    last_tick_time = time.time()
+    last_fall_time = time.time()
+    frame_count = 0
+    last_pet_seen_time = 0.0
+    current_pet_type = "None"
+
+    while True:
+        with state_lock:
+            target_cam_mode = telemetry_state.get("camera_mode", "LAPTOP")
+            active_base = telemetry_state["active_baseline_mps"]
+
+        if target_cam_mode != current_cam_mode or cap is None or not cap.isOpened():
+            if cap is not None: cap.release()
+            current_cam_mode = target_cam_mode
+            cap = get_camera_for_mode(current_cam_mode)
+            prev_gray = None
+
+        if cap is None or not cap.isOpened():
+            time.sleep(1.0)
+            continue
+
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            time.sleep(0.03)
+            continue
+            
+        if current_cam_mode == "360_PANORAMIC":
+            frame = cv2.resize(frame, (1280, 640))
+            PIXEL_TO_METER_SCALE = 0.008  
+        else:
+            frame = cv2.resize(frame, (640, 480))
+            PIXEL_TO_METER_SCALE = 0.035  
+
+        now = time.time()
+        dt = now - last_tick_time
+        last_tick_time = now if dt > 0.001 else last_tick_time + 0.001
+        frame_count += 1
+
+        frame = cv2.flip(frame, 1)
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        avg_brightness = np.mean(curr_gray)
+        is_night = 1 if avg_brightness < 25.0 else 0
+        with state_lock: telemetry_state["night_mode"] = is_night
+
+        curr_gray = cv2.GaussianBlur(curr_gray, (21, 21), 0)
+        trigger_db_update = False
+
+        if prev_gray is not None and not is_night:
+            frame_diff = cv2.absdiff(prev_gray, curr_gray)
+            thresh = cv2.threshold(frame_diff, 25, 255, cv2.THRESH_BINARY)[1]
+            
+            motion_pixels = float(np.sum(thresh > 0))
+            total_pixels = frame.shape[0] * frame.shape[1]
+            motion_ratio = (motion_pixels / total_pixels) * 100.0
+
+            if ai_net and motion_ratio > 0.5 and frame_count % 5 == 0:
+                blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
+                ai_net.setInput(blob)
+                detections = ai_net.forward()
+                
+                detected_any = False
+                for i in range(detections.shape[2]):
+                    confidence = detections[0, 0, i, 2]
+                    if confidence > 0.4:
+                        class_id = int(detections[0, 0, i, 1])
+                        if class_id in [8, 12, 15]:
+                            last_pet_seen_time = now
+                            current_pet_type = "Dog" if class_id == 12 else ("Cat" if class_id == 8 else "Human")
+                            detected_any = True
+                            box = detections[0, 0, i, 3:7] * np.array([frame.shape[1], frame.shape[0], frame.shape[1], frame.shape[0]])
+                            (startX, startY, endX, endY) = box.astype("int")
+                            box_color = (0, 0, 255) if class_id == 15 else (0, 255, 0)
+                            label = f"AI LOCK: {current_pet_type} ({confidence * 100:.1f}%)"
+                            cv2.rectangle(frame, (startX, startY), (endX, endY), box_color, 2)
+                            cv2.putText(frame, label, (startX, startY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+                            break
+                if not detected_any and (now - last_pet_seen_time) > 2.0:
+                    current_pet_type = "Motion Target"
+
+            with state_lock:
+                if motion_ratio < 0.8:
+                    if inactivity_start_time is None: inactivity_start_time = now
+                    elif (now - inactivity_start_time) > 3.0:
+                        telemetry_state["is_sleeping"] = 1
+                        telemetry_state["sleep_duration_sec"] += dt
+                else:
+                    inactivity_start_time = None
+                    telemetry_state["is_sleeping"] = 0
+
+                if motion_ratio > 35.0 and (now - last_fall_time > 4.0):
+                    telemetry_state["fall_count"] += 1
+                    last_fall_time = now
+                    trigger_db_update = True
+
+                if telemetry_state.get("security_mode", False) and motion_ratio > 2.0 and (now - last_security_alert_time > 3.0):
+                    telemetry_state["security_alert_triggered"] = True
+                    last_security_alert_time = now
+                    try:
+                        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+                        c = conn.cursor()
+                        c.execute("INSERT INTO telemetry_logs (timestamp, event_type, details) VALUES (?, ?, ?)",
+                                  (str(datetime.datetime.now()), 'SECURITY_ALERT', 'Unrecognized motion detected in security mode'))
+                        conn.commit()
+                        conn.close()
+                    except Exception: pass
+
+            velocity_mps = round((motion_ratio * PIXEL_TO_METER_SCALE * 10), 2)
+            if velocity_mps > 12.0: velocity_mps = 12.0
+
+            stride = 0.0
+            if velocity_mps > 0.2:
+                simulated_step_freq = 2.0 + (velocity_mps * 0.2)
+                stride = round(velocity_mps / simulated_step_freq, 2)
+
+            with state_lock:
+                telemetry_state["current_velocity_mps"] = velocity_mps
+                telemetry_state["current_stride_length_m"] = stride
+                
+                if telemetry_state["waiting_for_reaction"] and velocity_mps > 0.5:
+                    reaction_time = now - telemetry_state["buzzer_timestamp"]
+                    telemetry_state["cognitive_reaction_time_sec"] = round(reaction_time, 2)
+                    telemetry_state["waiting_for_reaction"] = False
+                
+                if telemetry_state["fetch_active"] == 1:
+                    active_move_time = now - telemetry_state["fetch_start_time"]
+                    telemetry_state["last_lap_sec"] = round(active_move_time, 1)
+                    if active_move_time > 1.0 and velocity_mps < 0.2:
+                        final_lap = telemetry_state["last_lap_sec"]
+                        if telemetry_state["fastest_lap_sec"] == 99.9 or final_lap < telemetry_state["fastest_lap_sec"]:
+                            telemetry_state["fastest_lap_sec"] = final_lap
+                            trigger_db_update = True
+                        telemetry_state["fetch_active"] = 0
+
+                if velocity_mps > telemetry_state["top_sprint_mps"]:
+                    telemetry_state["top_sprint_mps"] = velocity_mps
+                    trigger_db_update = True
+                    
+                if velocity_mps > 1.5:
+                    telemetry_state["sprint_sum"] += velocity_mps
+                    telemetry_state["sprint_count"] += 1
+                    telemetry_state["avg_sprint_mps"] = round(telemetry_state["sprint_sum"] / telemetry_state["sprint_count"], 2)
+                    
+                    if telemetry_state["avg_sprint_mps"] > 0:
+                        delta = ((telemetry_state["avg_sprint_mps"] - active_base) / active_base) * 100
+                        telemetry_state["limp_delta"] = round(delta, 1)
+                        telemetry_state["limp_trend"] = round(telemetry_state["limp_delta"] - telemetry_state["prev_day_asymmetry"], 1)
+
+                if velocity_mps < telemetry_state["min_sprint_mps"]: 
+                    telemetry_state["min_sprint_mps"] = velocity_mps
+        else:
+            with state_lock: 
+                telemetry_state["current_velocity_mps"] = 0.0
+                telemetry_state["current_stride_length_m"] = 0.0
+
+        if trigger_db_update: update_db_stats()
+        prev_gray = curr_gray
+
+        with state_lock:
+            velocity_val = telemetry_state['current_velocity_mps']
+            mode_val = telemetry_state['turret_mode']
+            angle_val = telemetry_state['turret_angle_deg']
+            dist_val = telemetry_state['launch_distance_ft']
+            stride_val = telemetry_state['current_stride_length_m']
+            night = telemetry_state['night_mode']
+            falls_val = telemetry_state['fall_count']
+            sec_mode_active = telemetry_state['security_mode']
+
+        cam_bottom_x = int(frame.shape[1] / 2)
+        cam_bottom_y = frame.shape[0] - 10
+        math_angle = math.radians(180 - angle_val)
+        line_length = dist_val * 25
+        target_x = int(cam_bottom_x + math.cos(math_angle) * line_length)
+        target_y = int(cam_bottom_y - math.sin(math_angle) * line_length)
+        
+        cv2.line(frame, (cam_bottom_x, cam_bottom_y), (target_x, target_y), (0, 255, 255), 2)
+        cv2.circle(frame, (target_x, target_y), 15, (0, 165, 255), 2)
+        
+        cv2.rectangle(frame, (10, 10), (460, 115), (0, 0, 0), -1)
+        mode_color = (0, 0, 255) if sec_mode_active else ((255, 0, 255) if night else ((0, 255, 136) if mode_val != 'MANUAL' else (255, 200, 0)))
+        status_text = "SECURITY ARMED 🚨" if sec_mode_active else ('NIGHT STANDBY' if night else mode_val)
+        
+        cv2.putText(frame, f"MODE: {status_text}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, mode_color, 2)
+        cv2.putText(frame, f"VEL: {velocity_val} m/s | STRIDE: {stride_val} m", (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 242, 254), 2)
+        cv2.putText(frame, f"FALLS DETECTED: {falls_val}", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+
+        with frame_lock: output_frame = frame.copy()
+        time.sleep(0.03)
+
+# ==========================================
+# 7. FLASK PWA & API ENDPOINTS
+# ==========================================
+def generate_mjpeg_stream():
+    global output_frame
+    while True:
+        current_frame = None
+        with frame_lock:
+            if output_frame is not None: current_frame = output_frame.copy()
+        
+        if current_frame is None:
+            time.sleep(0.02)
+            continue
+            
+        ret, encoded_image = cv2.imencode(".jpg", current_frame)
+        if not ret: continue
+            
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encoded_image) + b'\r\n')
+        time.sleep(0.03)
+
+@app.route('/video_feed')
+def video_feed(): return Response(generate_mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/telemetry')
+def get_telemetry(): 
+    with state_lock: return jsonify(telemetry_state)
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username", ""))
+    password = str(data.get("password", ""))
+    if username == AUTH_USER and password == AUTH_PASS:
+        session["authenticated"] = True
+        return jsonify({"success": True})
+    return jsonify({"error": "Invalid username or password."}), 401
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    session.pop("authenticated", None)
+    return jsonify({"success": True})
+
+@app.route('/api/auth-status')
+def api_auth_status():
+    return jsonify({"authenticated": session.get("authenticated", False)})
+
+def require_auth():
+    if not session.get("authenticated"):
+        return jsonify({"error": "Unauthorized"}), 401
+    return None
+
+@app.route('/api/profiles', methods=['GET', 'POST'])
+def manage_profiles():
+    if request.method == 'POST':
+        auth_err = require_auth()
+        if auth_err: return auth_err
+        data = request.get_json() or {}
+        dog_data = data.get("Dog", {})
+        cat_data = data.get("Cat", {})
+        human_data = data.get("Human", {})
+        
+        if dog_data: update_pet_profile_db("Dog", dog_data.get("name", "Carbon"), dog_data.get("birthday", ""), dog_data.get("breed", ""), float(dog_data.get("weight", 0) or 0))
+        if cat_data: update_pet_profile_db("Cat", cat_data.get("name", "Kitty"), cat_data.get("birthday", ""), cat_data.get("breed", ""), float(cat_data.get("weight", 0) or 0))
+        if human_data: update_pet_profile_db("Human", human_data.get("name", "Owner"), human_data.get("birthday", ""), "", 0)
+        
+        return jsonify({"status": "updated"})
+    with state_lock:
+        return jsonify(pet_profiles)
+
+@app.route('/api/turret/mode', methods=['POST'])
+def toggle_mode():
+    auth_err = require_auth()
+    if auth_err: return auth_err
+    data = request.get_json() or {}
+    mode = data.get("mode", "MANUAL")
+    with state_lock: 
+        telemetry_state["turret_mode"] = mode
+        if mode == "HIIT_ROUTINE": telemetry_state["hiit_next_action_time"] = time.time() + 2.0
+    return jsonify({"mode": mode})
+
+@app.route('/api/camera/mode', methods=['POST'])
+def toggle_camera_mode():
+    auth_err = require_auth()
+    if auth_err: return auth_err
+    data = request.get_json() or {}
+    cam_mode = data.get("camera_mode", "LAPTOP")
+    with state_lock:
+        telemetry_state["camera_mode"] = cam_mode
+    return jsonify({"camera_mode": cam_mode})
+
+@app.route('/api/turret/aim', methods=['POST'])
+def aim_turret():
+    auth_err = require_auth()
+    if auth_err: return auth_err
+    data = request.get_json() or {}
+    with state_lock:
+        telemetry_state["turret_mode"] = "MANUAL" 
+        telemetry_state["turret_angle_deg"] = int(data.get("angle", 90))
+        telemetry_state["launch_distance_ft"] = int(data.get("distance", 6))
+    return jsonify({"status": "AIMED"})
+
+@app.route('/api/turret/fire', methods=['POST'])
+def fire_turret():
+    auth_err = require_auth()
+    if auth_err: return auth_err
+    with state_lock:
+        telemetry_state["turret_mode"] = "MANUAL"
+        trigger_launch_sequence(telemetry_state["turret_angle_deg"], telemetry_state["launch_distance_ft"], is_auto=False)
+    return jsonify({"status": "INSTANT_LAUNCH"})
+
+@app.route('/api/turret/refill', methods=['POST'])
+def refill_turret():
+    auth_err = require_auth()
+    if auth_err: return auth_err
+    with state_lock: telemetry_state["treats_remaining"] = MAX_TREAT_CAPACITY
+    return jsonify({"status": "REFILLED"})
+
+@app.route('/api/security/toggle', methods=['POST'])
+def toggle_security_mode():
+    auth_err = require_auth()
+    if auth_err: return auth_err
+    with state_lock:
+        telemetry_state["security_mode"] = not telemetry_state["security_mode"]
+        current_status = telemetry_state["security_mode"]
+    return jsonify({"status": "success", "security_mode": current_status})
+
+@app.route('/api/security/status', methods=['GET'])
+def check_security_status():
+    with state_lock:
+        alert = telemetry_state["security_alert_triggered"]
+        telemetry_state["security_alert_triggered"] = False  
+    return jsonify({"alert": alert})
+
+@app.route('/api/reset_stats', methods=['POST'])
+def reset_stats():
+    auth_err = require_auth()
+    if auth_err: return auth_err
+    with state_lock:
+        telemetry_state["fall_count"] = 0
+        telemetry_state["treats_dispensed_today"] = 0
+    update_db_stats()
+    return jsonify({"status": "STATS_RESET"})
+
+@app.route('/api/export_vet_report')
+def export_vet_report():
+    with state_lock:
+        try:
+            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute("SELECT date, top_speed, fastest_lap, falls, treats, limp_delta_val FROM daily_stats ORDER BY date DESC")
+            rows = c.fetchall()
+            conn.close()
+            
+            csv_data = "Date,Top_Speed_mps,Fastest_Lap_sec,Falls_Detected,Treats_Dispensed,Gait_Asymmetry_Delta\n"
+            for r in rows:
+                csv_data += f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]}%\n"
+                
+            return Response(csv_data, mimetype="text/csv", headers={"Content-disposition": "attachment; filename=Carbon_Vet_Report.csv"})
+        except Exception as e:
+            return f"Error generating report: {e}"
+
+@app.route('/manifest.json')
+def manifest():
+    return jsonify({"name": "PitPaws Titan Edition", "short_name": "PitPaws", "display": "standalone", "background_color": "#080b11", "theme_color": "#080b11", "icons": [{"src": "https://cdn-icons-png.flaticon.com/512/616/616408.png", "sizes": "512x512", "type": "image/png"}]})
+
+@app.route('/sw.js')
+def service_worker(): return Response("self.addEventListener('fetch', function(event) {});", mimetype='application/javascript')
+
+# ==========================================
+# 8. TAILWIND TITAN-DASHBOARD UI
+# ==========================================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>PitPaws // Titan Station</title>
+    <link rel="manifest" href="/manifest.json">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap');
+        body { font-family: 'Inter', sans-serif; -webkit-tap-highlight-color: transparent; }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .glass { background: rgba(18, 24, 38, 0.75); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); transition: all 0.5s ease; }
+        .glow-cyan { box-shadow: 0 0 20px rgba(6, 182, 212, 0.15); }
+        .glow-red { box-shadow: 0 0 25px rgba(239, 68, 68, 0.4); border-color: rgba(239, 68, 68, 0.6); }
+        .glow-orange { box-shadow: 0 0 30px rgba(249, 115, 22, 0.6); border-color: rgba(249, 115, 22, 0.8); }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    </style>
+</head>
+<body id="app-body" class="bg-[#080b11] text-slate-200 min-h-screen p-4 lg:p-6 pb-20 transition-all duration-700">
+
+    <!-- Login Modal Gate -->
+    <div id="modal-login" class="fixed inset-0 z-50 bg-black/90 flex items-center justify-center backdrop-blur-md">
+        <div class="glass p-8 rounded-2xl w-full max-w-sm border border-slate-700 m-4 shadow-2xl">
+            <div class="text-center mb-6">
+                <div class="inline-block p-3 bg-cyan-500/10 border border-cyan-500/30 rounded-2xl text-cyan-400 mb-3">
+                    <i data-lucide="paw-print" class="w-8 h-8"></i>
+                </div>
+                <h2 class="text-xl font-extrabold text-white tracking-wider">PITPAWS ACCESS</h2>
+                <p class="text-xs text-slate-400 mt-1">Please log in to view the station.</p>
+            </div>
+            <div class="space-y-3 mb-5">
+                <input id="input-username" type="text" placeholder="Username" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-3 text-white text-sm focus:outline-none focus:border-cyan-500">
+                <input id="input-password" type="password" placeholder="Password" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-3 text-white text-sm focus:outline-none focus:border-cyan-500">
+            </div>
+            <button onclick="submitLogin()" class="w-full py-3 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-500 text-white font-bold text-sm shadow-lg shadow-cyan-500/20 active:scale-95 transition">Authorize Station</button>
+        </div>
+    </div>
+
+    <!-- Enhanced Pet Modal -->
+    <div id="pet-modal" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center backdrop-blur-sm">
+        <div class="glass p-6 rounded-2xl w-full max-w-md border border-slate-700 m-4 max-h-[90vh] overflow-y-auto no-scrollbar">
+            <h2 class="text-xl font-bold text-white mb-5"><i data-lucide="scan-face" class="inline w-5 h-5 mr-2"></i>Entity Profiles</h2>
+            
+            <div class="mb-4 p-4 rounded-xl bg-cyan-900/10 border border-cyan-500/20 space-y-3">
+                <h3 class="text-cyan-400 text-sm font-semibold flex items-center gap-2"><i data-lucide="dog" class="w-4 h-4"></i> PRIMARY DOG</h3>
+                <input id="dog-name" type="text" placeholder="Dog's Name" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-cyan-500">
+                <input id="dog-breed" type="text" placeholder="Breed (e.g., Labrador)" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-cyan-500">
+                <div class="flex gap-2">
+                    <input id="dog-bday" type="date" title="Birthday" class="w-1/2 bg-slate-900 border border-slate-700 rounded-lg p-2 text-slate-400 text-sm focus:outline-none focus:border-cyan-500">
+                    <input id="dog-weight" type="number" placeholder="Weight (kg)" class="w-1/2 bg-slate-900 border border-slate-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-cyan-500">
+                </div>
+            </div>
+
+            <div class="mb-4 p-4 rounded-xl bg-orange-900/10 border border-orange-500/20">
+                <h3 class="text-orange-400 text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="cat" class="w-4 h-4"></i> PRIMARY CAT</h3>
+                <input id="cat-name" type="text" placeholder="Cat's Name" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-orange-500">
+            </div>
+
+            <div class="mb-6 p-4 rounded-xl bg-emerald-900/10 border border-emerald-500/20">
+                <h3 class="text-emerald-400 text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="user" class="w-4 h-4"></i> PRIMARY HUMAN</h3>
+                <input id="human-name" type="text" placeholder="Owner's Name" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white text-sm focus:outline-none focus:border-emerald-500">
+            </div>
+            
+            <div class="flex justify-end gap-3 sticky bottom-0">
+                <button onclick="closePetModal()" class="px-5 py-2.5 rounded-lg bg-slate-800 text-slate-300 font-semibold text-sm">Cancel</button>
+                <button onclick="savePetProfiles()" class="px-5 py-2.5 rounded-lg bg-gradient-to-r from-cyan-500 to-blue-500 text-white font-bold text-sm">Save Profiles</button>
+            </div>
+        </div>
+    </div>
+
+    <header class="flex justify-between items-center pb-6 mb-6 border-b border-slate-800/80">
+        <div class="flex items-center gap-3">
+            <div id="bark-icon" class="p-2.5 bg-cyan-500/10 border border-cyan-500/30 rounded-xl text-cyan-400">
+                <i data-lucide="crosshair" class="w-6 h-6"></i>
+            </div>
+            <div>
+                <h1 class="font-extrabold text-xl tracking-wider text-white">PITPAWS <span class="text-cyan-400 text-xs px-2 py-0.5 rounded bg-cyan-950 border border-cyan-800 mono hidden sm:inline-block">TITAN DIAGNOSTICS</span></h1>
+            </div>
+        </div>
+
+        <div class="flex items-center gap-3">
+            <button onclick="handleLogout()" class="px-3 py-1.5 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-semibold hover:bg-red-500/20 transition">LOGOUT</button>
+            <div class="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-[10px] mono">
+                <i data-lucide="clock" class="w-3 h-3"></i> <span id="clock-display">--:--:--</span>
+            </div>
+            <div id="ai-badge" class="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-purple-500/10 border border-purple-500/20 text-purple-400 text-[10px] mono">
+                <i data-lucide="brain" class="w-3 h-3"></i> KINEMATICS ACTIVE
+            </div>
+            <div id="mode-badge" class="flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 text-[10px] sm:text-xs font-semibold">
+                MANUAL MODE
+            </div>
+        </div>
+    </header>
+
+    <main class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        
+        <div class="lg:col-span-2 space-y-6">
+            
+            <div id="video-container" class="glass rounded-2xl overflow-hidden relative border border-slate-800 glow-cyan transition-all duration-300">
+                <div class="absolute top-4 left-4 z-10 flex items-center gap-2 px-3 py-1 bg-black/70 backdrop-blur rounded-md text-[10px] sm:text-xs mono text-cyan-400 border border-cyan-500/30">
+                    <i data-lucide="camera" class="w-3.5 h-3.5"></i> <span id="camera-label">FIXED KINEMATICS</span>
+                </div>
+                <div class="aspect-video bg-black flex items-center justify-center relative">
+                    <img src="/video_feed" class="w-full h-full object-contain" alt="Kinematic Vision Feed">
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div id="limp-alert-box" class="glass rounded-2xl p-5 border border-slate-800 text-center transition-all duration-500 flex flex-col justify-center items-center">
+                    <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 flex items-center justify-center gap-2">
+                        <i data-lucide="activity" class="w-4 h-4"></i> Orthopedic Status & Falls
+                    </h3>
+                    <div class="flex items-center gap-3 mt-1 flex-wrap justify-center">
+                        <div class="text-xs text-slate-400 mono">Trend: <span id="limp-trend-val" class="font-bold text-base text-cyan-400">0.0%</span></div>
+                        <div id="ortho-status-badge" class="px-3 py-1 rounded-full text-xs font-extrabold uppercase tracking-wider bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">Normal</div>
+                    </div>
+                    <div class="text-xs text-slate-400 mt-3 mono">Falls Registered Today: <span id="fall-count-val" class="font-bold text-red-400">0</span></div>
+                </div>
+
+                <div class="glass rounded-2xl p-5 border border-slate-800 hidden md:block">
+                    <div class="flex justify-between items-center mb-2">
+                        <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mono flex items-center gap-2">
+                            <i data-lucide="gauge" class="w-4 h-4 text-cyan-400"></i> Sprint Velocity (m/s)
+                        </h3>
+                    </div>
+                    <div class="h-20 w-full relative">
+                        <canvas id="velocityChart"></canvas>
+                        <div class="absolute bottom-0 right-0 text-[9px] text-slate-500 mono" id="active-baseline-display">Base: 3.5 m/s</div>
+                    </div>
+                </div>
+            </div>
+            
+        </div>
+
+        <div class="space-y-4">
+            
+            <div class="glass rounded-2xl p-4 border border-slate-800 text-center">
+                <span class="text-xs text-slate-400 uppercase tracking-wider mono flex items-center justify-center gap-1.5 mb-3">
+                    <i data-lucide="shield-alert" class="w-4 h-4 text-red-400"></i> Surveillance Security Mode
+                </span>
+                <button id="sec-btn" onclick="toggleSecurityMode()" class="w-full py-2.5 px-4 rounded-xl border border-slate-700 bg-slate-800 text-slate-300 font-bold text-xs transition active:scale-95 flex items-center justify-center gap-2">
+                    <i data-lucide="shield" class="w-4 h-4"></i> SECURITY SYSTEM: OFF
+                </button>
+            </div>
+
+            <div class="glass rounded-2xl p-4 border border-slate-800 text-center">
+                <span class="text-xs text-slate-400 uppercase tracking-wider mono flex items-center justify-center gap-1.5 mb-2">
+                    <i data-lucide="video" class="w-4 h-4 text-cyan-400"></i> Camera Hardware Option
+                </span>
+                <div class="grid grid-cols-3 gap-2">
+                    <button id="cam-btn-laptop" onclick="setCameraMode('LAPTOP')" class="py-2 px-1 rounded-xl border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 font-semibold text-[10px] transition active:scale-95">
+                        LAPTOP CAM
+                    </button>
+                    <button id="cam-btn-extended" onclick="setCameraMode('EXTENDED')" class="py-2 px-1 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] hover:border-slate-600 transition active:scale-95">
+                        EXTENDED CAM
+                    </button>
+                    <button id="cam-btn-360" onclick="setCameraMode('360_PANORAMIC')" class="py-2 px-1 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] hover:border-slate-600 transition active:scale-95">
+                        360° PANORAMIC
+                    </button>
+                </div>
+            </div>
+
+            <div class="glass rounded-2xl p-5 border border-slate-800 text-center">
+                <span class="text-xs text-slate-400 uppercase tracking-wider mono flex items-center justify-center gap-1.5 mb-3">
+                    <i data-lucide="bot" class="w-4 h-4 text-cyan-400"></i> Turret Mode Selector
+                </span>
+                <div class="grid grid-cols-3 gap-2">
+                    <button id="btn-manual" onclick="setTurretMode('MANUAL')" class="py-2 px-2 rounded-xl border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 font-semibold text-[10px] transition active:scale-95">
+                        MANUAL
+                    </button>
+                    <button id="btn-auto" onclick="setTurretMode('AUTO_LURE')" class="py-2 px-2 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] hover:border-slate-600 transition active:scale-95">
+                        AUTO PATROL
+                    </button>
+                    <button id="btn-hiit" onclick="setTurretMode('HIIT_ROUTINE')" class="py-2 px-2 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] hover:border-slate-600 transition active:scale-95">
+                        HIIT ROUTINE
+                    </button>
+                </div>
+            </div>
+
+            <div class="glass rounded-2xl p-5 border border-amber-500/30 bg-amber-500/5">
+                <div class="space-y-3 mb-4 text-left">
+                    <div>
+                        <div class="flex justify-between text-[10px] sm:text-xs mono text-slate-400 mb-1">
+                            <span>PAN:</span> <span id="angle-val" class="text-cyan-400 font-bold">90°</span>
+                        </div>
+                        <input type="range" id="angle-slider" min="0" max="180" value="90" onchange="updateAim()" oninput="updateAimText()" class="w-full accent-cyan-400 bg-slate-800 h-2 rounded-lg cursor-pointer">
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-[10px] sm:text-xs mono text-slate-400 mb-1">
+                            <span>DISTANCE:</span> <span id="dist-val" class="text-amber-400 font-bold">6 FT</span>
+                        </div>
+                        <input type="range" id="dist-slider" min="3" max="10" value="6" onchange="updateAim()" oninput="updateAimText()" class="w-full accent-amber-400 bg-slate-800 h-2 rounded-lg cursor-pointer">
+                    </div>
+                </div>
+                <button id="btn-fire" onclick="fireTurret()" class="w-full py-4 px-4 bg-gradient-to-r from-amber-500 to-orange-500 text-black font-extrabold rounded-xl transition shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2 active:scale-95">
+                    <i data-lucide="zap" class="w-5 h-5 fill-black"></i> INITIATE LAUNCH
+                </button>
+            </div>
+
+            <div class="grid grid-cols-3 gap-3 mt-1">
+                <div class="glass rounded-2xl p-4 border border-slate-800 bg-gradient-to-br from-indigo-500/5 to-transparent">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider mono flex items-center gap-1">
+                        <i data-lucide="flag" class="w-3 h-3 text-indigo-400"></i> Last Lap
+                    </span>
+                    <div class="text-xl font-extrabold text-indigo-400 mt-1 mono"><span id="last-lap">0.0</span><span class="text-[10px] text-slate-500">s</span></div>
+                </div>
+                
+                <div class="glass rounded-2xl p-4 border border-slate-800 bg-gradient-to-br from-yellow-500/5 to-transparent">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider mono flex items-center gap-1">
+                        <i data-lucide="database" class="w-3 h-3 text-yellow-400"></i> Best (DB)
+                    </span>
+                    <div class="text-xl font-extrabold text-yellow-400 mt-1 mono"><span id="fastest-lap">--</span><span class="text-[10px] text-slate-500 hidden" id="fastest-lap-unit">s</span></div>
+                </div>
+
+                <div id="reaction-box" class="glass rounded-2xl p-4 border border-slate-800 bg-gradient-to-br from-purple-500/5 to-transparent transition-all">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider mono flex items-center gap-1">
+                        <i data-lucide="brain" class="w-3 h-3 text-purple-400" id="reaction-icon"></i> Reaction
+                    </span>
+                    <div id="reaction-text" class="text-xl font-extrabold text-purple-400 mt-1 mono"><span id="reaction-time">0.0</span><span class="text-[10px] text-slate-500">s</span></div>
+                    <div class="text-[9px] text-slate-500 mono mt-1" id="reaction-baseline-display">Expected: 0.5s</div>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-3">
+                <div class="glass rounded-2xl p-3 border border-slate-800">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider mono">Peak Spd</span>
+                    <div class="text-lg font-extrabold text-emerald-400 mt-1 mono"><span id="metric-top-speed">0.0</span></div>
+                </div>
+                <div class="glass rounded-2xl p-3 border border-slate-800" id="avg-speed-box">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider mono">Avg Spd</span>
+                    <div class="text-lg font-extrabold text-blue-400 mt-1 mono"><span id="metric-avg-speed">0.0</span></div>
+                    <div class="text-[9px] text-slate-500 mono mt-1" id="avg-speed-expected">Expected: 3.5m/s</div>
+                </div>
+                <div class="glass rounded-2xl p-3 border border-slate-800">
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider mono">Min Spd</span>
+                    <div class="text-lg font-extrabold text-purple-400 mt-1 mono"><span id="metric-min-speed">0.0</span></div>
+                </div>
+                <div class="glass rounded-2xl p-3 border border-pink-500/30 bg-pink-500/5">
+                    <span class="text-[10px] text-pink-400 uppercase tracking-wider mono flex items-center gap-1">
+                        <i data-lucide="ruler" class="w-3 h-3"></i> Stride Len
+                    </span>
+                    <div class="text-lg font-extrabold text-pink-400 mt-1 mono"><span id="metric-stride">0.00</span><span class="text-[10px] text-slate-500 ml-1">m</span></div>
+                </div>
+            </div>
+
+            <div class="glass rounded-2xl p-4 border border-slate-800 flex justify-between items-center">
+                <div>
+                    <span class="text-xs text-slate-400 uppercase tracking-wider mono">Treat Reservoir</span>
+                    <div class="text-2xl font-extrabold text-white mt-0.5 mono"><span id="treat-remaining">25</span><span class="text-slate-500 text-xs"> / 25</span></div>
+                    <div class="text-[10px] text-emerald-400 mt-1 mono font-semibold tracking-wider">GIVEN TODAY: <span id="treats-dispensed">0</span></div>
+                </div>
+                <button onclick="refillTurret()" class="py-2 px-4 bg-slate-800 text-slate-300 text-xs font-semibold rounded-lg border border-slate-700 active:scale-95">REFILL</button>
+            </div>
+            
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <button onclick="resetStats()" class="w-full py-3 rounded-xl border border-red-900/30 bg-red-900/10 text-red-400 font-semibold text-[10px] transition hover:bg-red-900/20 active:scale-95 flex items-center justify-center gap-1.5">
+                    <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i> RESET
+                </button>
+                <button onclick="openPetModal()" class="w-full py-3 rounded-xl border border-slate-700 bg-slate-800 text-slate-300 font-semibold text-[10px] transition hover:bg-slate-700 active:scale-95 flex items-center justify-center gap-1.5">
+                    <i data-lucide="users" class="w-3.5 h-3.5"></i> PROFILES
+                </button>
+                <a href="/api/export_vet_report" class="w-full py-3 rounded-xl border border-emerald-500/40 bg-emerald-500/20 text-emerald-300 font-semibold text-[10px] transition hover:bg-emerald-500/30 active:scale-95 flex items-center justify-center gap-1.5">
+                    <i data-lucide="download" class="w-3.5 h-3.5"></i> VET REPORT
+                </a>
+                <button id="btn-buzzer" onclick="toggleManualBuzzer()" class="w-full py-3 rounded-xl border border-slate-700 bg-slate-800 text-slate-300 font-semibold text-[10px] transition hover:bg-slate-700 active:scale-95 flex items-center justify-center gap-1.5">
+                    <i data-lucide="volume-x" class="w-3.5 h-3.5"></i> PLAY BUZZER
+                </button>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        try { if (typeof lucide !== 'undefined') lucide.createIcons(); } catch(e) {}
+        
+        let audioCtx = null;
+        function unlockAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+        window.addEventListener('click', unlockAudio, { once: true });
+        window.addEventListener('touchstart', unlockAudio, { once: true });
+
+        // MASTER KILL SWITCH & MANUAL BUZZER LOGIC
+        let manualBuzzerActive = false;
+        let manualOsc = null;
+        let manualGain = null;
+
+        function toggleManualBuzzer() {
+            manualBuzzerActive = !manualBuzzerActive;
+            const btn = document.getElementById('btn-buzzer');
+            
+            let ctx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+            if (!audioCtx) audioCtx = ctx;
+
+            if (manualBuzzerActive) {
+                btn.classList.add('bg-red-600', 'text-white', 'border-red-500', 'animate-pulse');
+                btn.classList.remove('bg-slate-800', 'text-slate-300');
+                btn.innerHTML = '<i data-lucide="volume-2" class="w-3.5 h-3.5"></i> STOP BUZZER';
+                
+                manualOsc = ctx.createOscillator();
+                manualGain = ctx.createGain();
+                manualOsc.type = 'square';
+                manualOsc.frequency.value = 850;
+                
+                let lfo = ctx.createOscillator();
+                lfo.type = 'sine';
+                lfo.frequency.value = 5; 
+                lfo.connect(manualGain.gain);
+                lfo.start();
+                
+                manualGain.gain.value = 0.5;
+                manualOsc.connect(manualGain);
+                manualGain.connect(ctx.destination);
+                manualOsc.start();
+            } else {
+                btn.classList.remove('bg-red-600', 'text-white', 'border-red-500', 'animate-pulse');
+                btn.classList.add('bg-slate-800', 'text-slate-300');
+                btn.innerHTML = '<i data-lucide="volume-x" class="w-3.5 h-3.5"></i> PLAY BUZZER';
+                
+                if (manualOsc) {
+                    try {
+                        manualOsc.stop();
+                        manualOsc.disconnect();
+                        manualGain.disconnect();
+                    } catch(e) {}
+                    manualOsc = null;
+                }
+            }
+            try { if (typeof lucide !== 'undefined') lucide.createIcons(); } catch(e){}
+        }
+
+        async function checkAuthGate() {
+            try {
+                const res = await fetch('/api/auth-status');
+                const data = await res.json();
+                if (data.authenticated) {
+                    document.getElementById('modal-login').classList.add('hidden');
+                } else {
+                    document.getElementById('modal-login').classList.remove('hidden');
+                }
+            } catch(e) {}
+        }
+        checkAuthStatusLoop();
+        function checkAuthStatusLoop() {
+            checkAuthGate();
+            setTimeout(checkAuthStatusLoop, 3000);
+        }
+
+        async function submitLogin() {
+            const username = document.getElementById('input-username').value;
+            const password = document.getElementById('input-password').value;
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ username, password })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    document.getElementById('modal-login').classList.add('hidden');
+                } else {
+                    alert(data.error || "Login failed.");
+                }
+            } catch(e) {
+                alert("Network error during login.");
+            }
+        }
+
+        async function handleLogout() {
+            await fetch('/api/logout', { method: 'POST' });
+            checkAuthGate();
+        }
+
+        setInterval(() => {
+            const timeStr = new Date().toLocaleTimeString('en-US', { hour12: false });
+            const clockEl = document.getElementById('clock-display');
+            if (clockEl) clockEl.innerText = timeStr;
+        }, 1000);
+
+        let currentProfiles = { Dog: {name: 'Carbon', breed: '', birthday: '', weight: 0.0}, Cat: {name: 'Kitty'}, Human: {name: 'Owner'} };
+        async function loadProfiles() {
+            try {
+                const res = await fetch('/api/profiles');
+                if(res.status === 401) { document.getElementById('modal-login').classList.remove('hidden'); return; }
+                currentProfiles = await res.json();
+            } catch(e) {}
+        }
+        loadProfiles();
+
+        function openPetModal() {
+            document.getElementById('dog-name').value = currentProfiles.Dog.name || '';
+            document.getElementById('dog-breed').value = currentProfiles.Dog.breed || '';
+            document.getElementById('dog-bday').value = currentProfiles.Dog.birthday || '';
+            document.getElementById('dog-weight').value = currentProfiles.Dog.weight || '';
+            
+            document.getElementById('cat-name').value = currentProfiles.Cat.name || '';
+            document.getElementById('human-name').value = currentProfiles.Human.name || '';
+            document.getElementById('pet-modal').classList.remove('hidden');
+        }
+        function closePetModal() { document.getElementById('pet-modal').classList.add('hidden'); }
+        async function savePetProfiles() {
+            const payload = {
+                Dog: { 
+                    name: document.getElementById('dog-name').value, 
+                    breed: document.getElementById('dog-breed').value,
+                    birthday: document.getElementById('dog-bday').value,
+                    weight: parseFloat(document.getElementById('dog-weight').value) || 0.0
+                },
+                Cat: { name: document.getElementById('cat-name').value, birthday: '' },
+                Human: { name: document.getElementById('human-name').value, birthday: '' }
+            };
+            try {
+                const res = await fetch('/api/profiles', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+                if(res.status === 401) { document.getElementById('modal-login').classList.remove('hidden'); return; }
+                currentProfiles = payload;
+                closePetModal();
+            } catch(e) {}
+        }
+
+        let velocityChart = null;
+        try {
+            const ctx = document.getElementById('velocityChart').getContext('2d');
+            velocityChart = new Chart(ctx, {
+                type: 'line',
+                data: { labels: Array(25).fill(''), datasets: [{ data: Array(25).fill(0), borderColor: '#06b6d4', borderWidth: 2, tension: 0.3, fill: true, backgroundColor: 'rgba(6, 182, 212, 0.08)', pointRadius: 0 }] },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { min: 0, max: 5 } } }
+            });
+        } catch(e) {}
+
+        async function setTurretMode(mode) { 
+            const res = await fetch('/api/turret/mode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode}) }); 
+            if(res.status === 401) document.getElementById('modal-login').classList.remove('hidden');
+        }
+
+        async function setCameraMode(camMode) {
+            const res = await fetch('/api/camera/mode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({camera_mode: camMode}) });
+            if(res.status === 401) document.getElementById('modal-login').classList.remove('hidden');
+        }
+
+        async function toggleSecurityMode() {
+            const res = await fetch('/api/security/toggle', { method: 'POST' });
+            if(res.status === 401) { document.getElementById('modal-login').classList.remove('hidden'); return; }
+            const data = await res.json();
+            updateSecurityUI(data.security_mode);
+        }
+
+        function updateSecurityUI(isActive) {
+            const secBtn = document.getElementById('sec-btn');
+            if (isActive) {
+                secBtn.innerHTML = '<i data-lucide="shield-alert" class="w-4 h-4 text-black"></i> SECURITY ARMED 🚨';
+                secBtn.className = 'w-full py-2.5 px-4 rounded-xl border border-red-500 bg-red-600 text-black font-extrabold text-xs transition active:scale-95 flex items-center justify-center gap-2 animate-pulse';
+            } else {
+                secBtn.innerHTML = '<i data-lucide="shield" class="w-4 h-4"></i> SECURITY SYSTEM: OFF';
+                secBtn.className = 'w-full py-2.5 px-4 rounded-xl border border-slate-700 bg-slate-800 text-slate-300 font-bold text-xs transition active:scale-95 flex items-center justify-center gap-2';
+            }
+            try { if (typeof lucide !== 'undefined') lucide.createIcons(); } catch(e){}
+        }
+
+        function playBuzzer() {
+            // If the user has manually toggled the buzzer active/stopped, respect their kill switch
+            if (manualBuzzerActive) return;
+            try {
+                let ctx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+                for (let i = 0; i < 2; i++) {
+                    let osc = ctx.createOscillator();
+                    let gain = ctx.createGain();
+                    osc.type = 'square'; 
+                    osc.frequency.value = 850; 
+                    gain.gain.value = 0.5; 
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    let startTime = ctx.currentTime + (i * 0.4);
+                    osc.start(startTime);
+                    osc.stop(startTime + 0.25); 
+                }
+            } catch(e) {}
+        }
+        
+        function playTreatAlert() {
+            try {
+                let ctx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+                for (let i = 0; i < 2; i++) {
+                    let osc = ctx.createOscillator();
+                    let gain = ctx.createGain();
+                    osc.type = 'square'; 
+                    osc.frequency.value = 450; 
+                    gain.gain.value = 1.0; 
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    let startTime = ctx.currentTime + (i * 0.4);
+                    osc.start(startTime);
+                    osc.stop(startTime + 0.25); 
+                }
+            } catch(e) {}
+        }
+
+        function updateAimText() { 
+            document.getElementById('angle-val').innerText = `${document.getElementById('angle-slider').value}°`; 
+            document.getElementById('dist-val').innerText = `${document.getElementById('dist-slider').value} FT`; 
+        }
+        async function updateAim() { 
+            const res = await fetch('/api/turret/aim', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({angle: document.getElementById('angle-slider').value, distance: document.getElementById('dist-slider').value}) }); 
+            if(res.status === 401) document.getElementById('modal-login').classList.remove('hidden');
+        }
+        async function fireTurret() { 
+            const res = await fetch('/api/turret/fire', { method: 'POST' }); 
+            if(res.status === 401) document.getElementById('modal-login').classList.remove('hidden');
+        }
+        async function refillTurret() { 
+            const res = await fetch('/api/turret/refill', { method: 'POST' }); 
+            if(res.status === 401) document.getElementById('modal-login').classList.remove('hidden');
+        }
+        
+        async function resetStats() {
+            if(confirm("Are you sure you want to reset today's fall count and treats given to zero?")) {
+                const res = await fetch('/api/reset_stats', { method: 'POST' });
+                if(res.status === 401) document.getElementById('modal-login').classList.remove('hidden');
+            }
+        }
+
+        let wasPreLaunch = false;
+        let securityActiveState = false;
+
+        async function syncTelemetry() {
+            try {
+                const res = await fetch('/api/telemetry');
+                const data = await res.json();
+                
+                const secRes = await fetch('/api/security/status');
+                const secData = await secRes.json();
+                if (secData.alert) {
+                    playBuzzer();
+                }
+
+                if (data.security_mode !== securityActiveState) {
+                    securityActiveState = data.security_mode;
+                    updateSecurityUI(securityActiveState);
+                }
+                
+                const manualBtn = document.getElementById('btn-manual');
+                const autoBtn = document.getElementById('btn-auto');
+                const hiitBtn = document.getElementById('btn-hiit');
+                const badge = document.getElementById('mode-badge');
+                const vidContainer = document.getElementById('video-container');
+                const camLabel = document.getElementById('camera-label');
+                const fireBtn = document.getElementById('btn-fire');
+                
+                const camLaptopBtn = document.getElementById('cam-btn-laptop');
+                const camExtendedBtn = document.getElementById('cam-btn-extended');
+                const cam360Btn = document.getElementById('cam-btn-360');
+                
+                const activeCamClass = 'py-2 px-1 rounded-xl border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 font-semibold text-[10px] transition active:scale-95';
+                const inactiveCamClass = 'py-2 px-1 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] hover:border-slate-600 transition active:scale-95';
+
+                camLaptopBtn.className = inactiveCamClass;
+                camExtendedBtn.className = inactiveCamClass;
+                cam360Btn.className = inactiveCamClass;
+
+                if (data.camera_mode === '360_PANORAMIC') {
+                    cam360Btn.className = activeCamClass;
+                } else if (data.camera_mode === 'EXTENDED') {
+                    camExtendedBtn.className = activeCamClass;
+                } else {
+                    camLaptopBtn.className = activeCamClass;
+                }
+
+                if (data.treats_remaining <= 0) {
+                    fireBtn.innerHTML = '<i data-lucide="x-circle" class="w-5 h-5 fill-slate-800"></i> HOPPER EMPTY';
+                    fireBtn.className = 'w-full py-4 px-4 bg-slate-800 text-slate-500 font-extrabold rounded-xl transition flex items-center justify-center gap-2 cursor-not-allowed';
+                    fireBtn.disabled = true;
+                    try { if (typeof lucide !== 'undefined') lucide.createIcons(); } catch(e){}
+                } else if (data.is_pre_launch && !wasPreLaunch) {
+                    playTreatAlert();
+                    fireBtn.innerHTML = '<i data-lucide="alert-triangle" class="w-5 h-5 fill-black"></i> STAND CLEAR - LAUNCHING';
+                    fireBtn.className = 'w-full py-4 px-4 bg-red-500 text-black font-extrabold rounded-xl transition shadow-lg shadow-red-500/50 flex items-center justify-center gap-2 animate-pulse';
+                    fireBtn.disabled = true;
+                    try { if (typeof lucide !== 'undefined') lucide.createIcons(); } catch(e){}
+                } else if (!data.is_pre_launch && (wasPreLaunch || fireBtn.disabled)) {
+                    fireBtn.innerHTML = '<i data-lucide="zap" class="w-5 h-5 fill-black"></i> INITIATE LAUNCH';
+                    fireBtn.className = 'w-full py-4 px-4 bg-gradient-to-r from-amber-500 to-orange-500 text-black font-extrabold rounded-xl transition shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2 active:scale-95';
+                    fireBtn.disabled = false;
+                    try { if (typeof lucide !== 'undefined') lucide.createIcons(); } catch(e){}
+                }
+                wasPreLaunch = data.is_pre_launch;
+
+                if (data.turret_mode === 'AUTO_LURE') {
+                    autoBtn.className = 'py-2 px-2 rounded-xl border border-emerald-500/40 bg-emerald-500/20 text-emerald-300 font-semibold text-[10px] transition active:scale-95'; 
+                    manualBtn.className = 'py-2 px-2 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] hover:border-slate-600 transition active:scale-95'; 
+                    hiitBtn.className = 'py-2 px-2 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] hover:border-slate-600 transition active:scale-95';
+                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> AUTO LURE PATROL';
+                    document.getElementById('angle-slider').value = data.turret_angle_deg;
+                    document.getElementById('dist-slider').value = data.launch_distance_ft;
+                    updateAimText();
+                } else if (data.turret_mode === 'HIIT_ROUTINE') {
+                    hiitBtn.className = 'py-2 px-2 rounded-xl border border-purple-500/40 bg-purple-500/20 text-purple-300 font-semibold text-[10px] transition active:scale-95';
+                    manualBtn.className = 'py-2 px-2 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] hover:border-slate-600 transition active:scale-95'; 
+                    autoBtn.className = 'py-2 px-2 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] hover:border-slate-600 transition active:scale-95';
+                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-purple-400 animate-ping"></span> HIIT WORKOUT';
+                } else {
+                    manualBtn.className = 'py-2 px-2 rounded-xl border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 font-semibold text-[10px] transition active:scale-95';
+                    autoBtn.className = 'py-2 px-2 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] hover:border-slate-600 transition active:scale-95'; 
+                    hiitBtn.className = 'py-2 px-2 rounded-xl border border-slate-700 bg-slate-800 text-slate-400 font-semibold text-[10px] hover:border-slate-600 transition active:scale-95';
+                    badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span> MANUAL AIM';
+                }
+                
+                if (data.is_pre_launch) {
+                    vidContainer.className = 'glass rounded-2xl overflow-hidden relative border border-orange-500 glow-orange transition-all duration-300';
+                    camLabel.innerHTML = '<span class="text-orange-400 font-bold">PAVLOVIAN PROTOCOL ACTIVE</span>';
+                } else if (data.security_mode) {
+                    vidContainer.className = 'glass rounded-2xl overflow-hidden relative border border-red-500 glow-red transition-all duration-300';
+                    camLabel.innerHTML = '<span class="text-red-400 font-bold">SURVEILLANCE SECURITY ARMED</span>';
+                } else {
+                    vidContainer.className = 'glass rounded-2xl overflow-hidden relative border border-slate-800 glow-cyan transition-all duration-300';
+                    if (data.camera_mode === '360_PANORAMIC') {
+                        camLabel.innerText = '360° PANORAMIC FEED';
+                    } else if (data.camera_mode === 'EXTENDED') {
+                        camLabel.innerText = 'EXTENDED USB CAMERA';
+                    } else {
+                        camLabel.innerText = 'LAPTOP WEBCAM FEED';
+                    }
+                }
+
+                document.getElementById('metric-top-speed').innerText = data.top_sprint_mps;
+                document.getElementById('metric-avg-speed').innerText = data.avg_sprint_mps;
+                document.getElementById('metric-min-speed').innerText = data.min_sprint_mps === 99.9 ? '0.0' : data.min_sprint_mps;
+                document.getElementById('metric-stride').innerText = data.current_stride_length_m.toFixed(2);
+                
+                document.getElementById('last-lap').innerText = data.last_lap_sec;
+                if (data.fastest_lap_sec !== 99.9) {
+                    document.getElementById('fastest-lap').innerText = data.fastest_lap_sec;
+                    const unitEl = document.getElementById('fastest-lap-unit');
+                    if (unitEl && unitEl.classList.contains('hidden')) unitEl.classList.remove('hidden');
+                }
+
+                document.getElementById('reaction-time').innerText = data.cognitive_reaction_time_sec;
+                const rxBaseDisplay = document.getElementById('reaction-baseline-display');
+                if (rxBaseDisplay) {
+                    rxBaseDisplay.innerText = `Expected: ${data.expected_reaction_sec}s`;
+                }
+
+                const rxBox = document.getElementById('reaction-box');
+                const rxText = document.getElementById('reaction-text');
+                const rxIcon = document.getElementById('reaction-icon');
+                
+                if (data.cognitive_reaction_time_sec > 0 && data.cognitive_reaction_time_sec > data.expected_reaction_sec + 0.5) {
+                    rxBox.className = 'glass rounded-2xl p-4 border border-red-500/50 bg-red-500/10 transition-all';
+                    rxText.className = 'text-xl font-extrabold text-red-400 mt-1 mono';
+                    rxIcon.className = 'w-3 h-3 text-red-400';
+                    rxBaseDisplay.innerText = `Expected: ${data.expected_reaction_sec}s | COGNITIVE DELAY!`;
+                    rxBaseDisplay.className = 'text-[9px] text-red-400 mono mt-1 font-bold';
+                } else {
+                    rxBox.className = 'glass rounded-2xl p-4 border border-slate-800 bg-gradient-to-br from-purple-500/5 to-transparent transition-all';
+                    rxText.className = 'text-xl font-extrabold text-purple-400 mt-1 mono';
+                    rxIcon.className = 'w-3 h-3 text-purple-400';
+                    rxBaseDisplay.className = 'text-[9px] text-slate-500 mono mt-1';
+                }
+
+                document.getElementById('treat-remaining').innerText = data.treats_remaining;
+                const treatsDispensedEl = document.getElementById('treats-dispensed');
+                if (treatsDispensedEl) treatsDispensedEl.innerText = data.treats_dispensed_today;
+                
+                const trendVal = data.limp_trend;
+                const trendEl = document.getElementById('limp-trend-val');
+                if (trendEl) {
+                    trendEl.innerText = (trendVal > 0 ? "+" : "") + trendVal + "%";
+                }
+
+                const fallCountEl = document.getElementById('fall-count-val');
+                if (fallCountEl) {
+                    fallCountEl.innerText = data.fall_count;
+                }
+
+                const limpBox = document.getElementById('limp-alert-box');
+                const statusBadge = document.getElementById('ortho-status-badge');
+                
+                if (data.limp_delta <= -12.0) {
+                    limpBox.className = 'glass rounded-2xl p-5 border border-red-500 bg-red-500/10 text-center glow-red transition-all duration-500 flex flex-col justify-center items-center';
+                    statusBadge.className = 'px-3 py-1 rounded-full text-xs font-extrabold uppercase tracking-wider bg-red-500/20 text-red-400 border border-red-500/40 animate-pulse';
+                    statusBadge.innerText = 'Critical // Take to Doctor';
+                } else if (data.limp_delta < -5.0) {
+                    limpBox.className = 'glass rounded-2xl p-5 border border-amber-500/30 bg-amber-500/10 text-center transition-all duration-500 flex flex-col justify-center items-center';
+                    statusBadge.className = 'px-3 py-1 rounded-full text-xs font-extrabold uppercase tracking-wider bg-amber-500/20 text-amber-400 border border-amber-500/40';
+                    statusBadge.innerText = 'Sub-Clinical';
+                } else {
+                    limpBox.className = 'glass rounded-2xl p-5 border border-slate-800 text-center transition-all duration-500 flex flex-col justify-center items-center';
+                    statusBadge.className = 'px-3 py-1 rounded-full text-xs font-extrabold uppercase tracking-wider bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+                    statusBadge.innerText = 'Normal';
+                }
+                
+                const activeBaseDisplay = document.getElementById('active-baseline-display');
+                if (activeBaseDisplay) {
+                    activeBaseDisplay.innerText = `Base: ${data.active_baseline_mps} m/s`;
+                }
+
+                const avgSpeedExpected = document.getElementById('avg-speed-expected');
+                if (avgSpeedExpected) {
+                    avgSpeedExpected.innerText = `Expected: ${data.active_baseline_mps} m/s`;
+                    if (data.avg_sprint_mps > 0 && data.avg_sprint_mps < (data.active_baseline_mps - 0.5)) {
+                        avgSpeedExpected.className = 'text-[9px] text-red-400 mono mt-1 font-bold';
+                    } else {
+                        avgSpeedExpected.className = 'text-[9px] text-slate-500 mono mt-1';
+                    }
+                }
+
+                if (velocityChart) {
+                    velocityChart.data.datasets[0].data.push(data.current_velocity_mps);
+                    velocityChart.data.datasets[0].shift();
+                    velocityChart.update('none');
+                }
+            } catch (e) {}
+        }
+        setInterval(syncTelemetry, 200);
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+# ==========================================
+# 9. APPLICATION ENTRY POINT
+# ==========================================
+if __name__ == '__main__':
+    init_db()
+    load_db_stats()
+    
+    threading.Thread(target=vision_thread_loop, daemon=True).start()
+    threading.Thread(target=system_monitor_thread, daemon=True).start()
+    threading.Thread(target=turret_logic_thread, daemon=True).start()
+    
+    if AUDIO_ENABLED:
+        threading.Thread(target=audio_monitor_thread, daemon=True).start()
+
+    print("[+] PitPaws Titan Edition v8.2 running at http://0.0.0.0:5001")
+    app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
